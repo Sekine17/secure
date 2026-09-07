@@ -14,14 +14,12 @@ import {
   UserPlus,
   ArrowLeft,
   Users,
+  Moon,
+  Coffee,
+  SlidersHorizontal,
 } from "lucide-react";
 
-// ---- sabitlər ----
-const WORK_START_HOUR = 9;
-const WORK_START_MIN = 0;
-const WORK_END_HOUR = 18;
-const WORK_END_MIN = 0;
-const GRACE_MINUTES = 10; // gecikmə güzəşt müddəti
+// ---- ID sabiti ----
 const ADMIN_PASSWORD = "admin123"; // demo üçün sadə parol
 
 const INITIAL_EMPLOYEES = [
@@ -30,6 +28,17 @@ const INITIAL_EMPLOYEES = [
   { id: "e3", name: "Tural Hüseynov", dept: "Nəqliyyat", initials: "TH" },
   { id: "e4", name: "Aynur Quliyeva", dept: "Ofis", initials: "AQ" },
 ];
+
+// ---- Şirkət iş qaydalarının default dəyərləri ----
+const DEFAULT_SETTINGS = {
+  workStart: "09:00",
+  workEnd: "18:00",
+  lunchStart: "13:00",
+  lunchEnd: "14:00",
+  graceMinutes: 15,
+  absentMinutes: 120,
+  nightShift: false,
+};
 
 function fmtTime(d) {
   return d.toLocaleTimeString("az-AZ", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
@@ -42,18 +51,42 @@ function initialsFor(name) {
   return (parts[0][0] + parts[1][0]).toUpperCase();
 }
 
-function lateInfoFor(date) {
-  const start = new Date(date);
-  start.setHours(WORK_START_HOUR, WORK_START_MIN + GRACE_MINUTES, 0, 0);
-  const diffMs = date.getTime() - start.getTime();
-  const diffMin = Math.round(diffMs / 60000);
-  return diffMin > 0 ? diffMin : 0;
+function toMinutes(hhmm) {
+  const [h, m] = (hhmm || "00:00").split(":").map(Number);
+  return h * 60 + (m || 0);
 }
 
-function isAfterWorkEnd(date) {
-  const end = new Date(date);
-  end.setHours(WORK_END_HOUR, WORK_END_MIN, 0, 0);
-  return date.getTime() >= end.getTime();
+// Skan vaxtına və şirkət qaydalarına əsasən status müəyyən edir
+// (köhnə vanilla-JS versiyasındakı processAttendance məntiqinin React qarşılığı)
+function resolveStatus(time, type, settings) {
+  const workStartMin = toMinutes(settings.workStart);
+  const workEndMin = toMinutes(settings.workEnd);
+  const lunchStartMin = toMinutes(settings.lunchStart);
+  const lunchEndMin = toMinutes(settings.lunchEnd);
+  const grace = Number(settings.graceMinutes) || 0;
+  const absentLimit = Number(settings.absentMinutes) || 0;
+
+  let nowMin = time.getHours() * 60 + time.getMinutes();
+  // Gecə növbəsi: yarımgecədən sonrakı saatları növbənin davamı kimi say
+  if (settings.nightShift && nowMin < workStartMin - 240) {
+    nowMin += 1440;
+  }
+
+  const inLunchWindow = nowMin >= lunchStartMin && nowMin <= lunchEndMin;
+  const afterHours = nowMin >= workEndMin;
+
+  if (type === "out") {
+    return { status: inLunchWindow ? "lunch-break" : "normal-out", lateMinutes: 0 };
+  }
+
+  // type === "in"
+  if (inLunchWindow) return { status: "lunch-return", lateMinutes: 0 };
+  if (afterHours) return { status: "after-hours", lateMinutes: 0 };
+
+  const diff = nowMin - workStartMin;
+  if (diff <= grace) return { status: "ontime", lateMinutes: 0 };
+  if (diff <= absentLimit) return { status: "late", lateMinutes: diff };
+  return { status: "halfday", lateMinutes: diff };
 }
 
 const CSS = `
@@ -151,6 +184,9 @@ export default function CheckInKiosk() {
   const [customTime, setCustomTime] = useState("09:00");
   const timeoutRef = useRef(null);
 
+  // Şirkət iş qaydaları (əvvəlki HTML versiyasındakı burger-menyu tənzimləmələri)
+  const [settings, setSettings] = useState(DEFAULT_SETTINGS);
+
   // görünüş: 'kiosk' | 'admin'
   const [view, setView] = useState("kiosk");
   const [adminAuthed, setAdminAuthed] = useState(false);
@@ -158,7 +194,7 @@ export default function CheckInKiosk() {
   const [pwInput, setPwInput] = useState("");
   const [pwError, setPwError] = useState(false);
 
-  // admin forması
+  // admin forması (yeni işçi)
   const [newName, setNewName] = useState("");
   const [newDept, setNewDept] = useState("");
 
@@ -189,9 +225,7 @@ export default function CheckInKiosk() {
       const time = resolveScanTime();
       const lastType = lastActionByEmp[emp.id];
       const type = lastType === "in" ? "out" : "in";
-      const afterHours = type === "in" && isAfterWorkEnd(time);
-      const lateMinutes = type === "in" && !afterHours ? lateInfoFor(time) : 0;
-      const status = type === "out" ? null : afterHours ? "after-hours" : lateMinutes > 0 ? "late" : "ontime";
+      const { status, lateMinutes } = resolveStatus(time, type, settings);
 
       const entry = {
         id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
@@ -207,18 +241,27 @@ export default function CheckInKiosk() {
       setLogs((prev) => [entry, ...prev]);
       setScanning(false);
 
-      let msg;
-      if (type === "out") {
-        msg = `${emp.name} çıxış etdi`;
-      } else if (afterHours) {
-        msg = `${emp.name} — iş günü artıq bitib (18:00-dan sonra), bu giriş qeyri-adi sayılır`;
-      } else if (lateMinutes > 0) {
-        msg = `${emp.name} daxil oldu — ${lateMinutes} dəq gecikmə`;
-      } else {
-        msg = `${emp.name} vaxtında daxil oldu`;
-      }
+      const msgMap = {
+        ontime: `${emp.name} vaxtında daxil oldu`,
+        late: `${emp.name} daxil oldu — ${lateMinutes} dəq gecikmə`,
+        halfday: `${emp.name} çox gec gəldi — yarım gün sayılır (${lateMinutes} dəq gecikmə)`,
+        "after-hours": `${emp.name} — iş günü artıq bitib, bu giriş qeyri-adi sayılır`,
+        "lunch-return": `${emp.name} nahardan qayıtdı`,
+        "lunch-break": `${emp.name} nahar fasiləsinə çıxdı`,
+        "normal-out": `${emp.name} çıxış etdi`,
+      };
 
-      setFlash({ msg, late: status === "late", danger: status === "after-hours" });
+      setFlash({
+        msg: msgMap[status] || `${emp.name} qeydə alındı`,
+        variant:
+          status === "halfday" || status === "after-hours"
+            ? "danger"
+            : status === "late"
+            ? "late"
+            : status === "lunch-return" || status === "lunch-break"
+            ? "info"
+            : "ontime",
+      });
     }, 1400);
   }
 
@@ -256,7 +299,7 @@ export default function CheckInKiosk() {
     }
   }
 
-  const todayLate = logs.filter((l) => l.type === "in" && l.lateMinutes > 0).length;
+  const todayLate = logs.filter((l) => l.type === "in" && (l.status === "late" || l.status === "halfday")).length;
   const todayIn = logs.filter((l) => l.type === "in").length;
 
   return (
@@ -271,6 +314,7 @@ export default function CheckInKiosk() {
         "--ontime": "#5fbf7d",
         "--late": "#e8a33d",
         "--danger": "#e8613d",
+        "--info": "#4dade8",
         "--text": "#e7edf0",
         "--muted": "#8695a0",
         background: "var(--bg)",
@@ -290,21 +334,30 @@ export default function CheckInKiosk() {
               KEÇİD-NƏZARƏT TERMİNALI · DEMO
             </div>
             <h1 style={{ fontSize: 26, fontWeight: 700, margin: 0 }}>
-              {view === "kiosk" ? "İşçi Giriş / Çıxış Sistemi" : "Admin Panel · İşçilər"}
+              {view === "kiosk" ? "İşçi Giriş / Çıxış Sistemi" : "Admin Panel"}
             </h1>
             <p style={{ color: "var(--muted)", fontSize: 14, marginTop: 6, maxWidth: 480 }}>
-              {view === "kiosk"
-                ? <>Barmaq izi ilə giriş-çıxış izlənməsi. İş saatı <span className="mono" style={{ color: "var(--text)" }}>09:00–18:00</span> ({GRACE_MINUTES} dəq güzəşt).</>
-                : "Bu bölmədən yeni işçi əlavə edə və ya mövcud işçini siyahıdan silə bilərsən."}
+              {view === "kiosk" ? (
+                <>
+                  Barmaq izi ilə giriş-çıxış izlənməsi. İş saatı{" "}
+                  <span className="mono" style={{ color: "var(--text)" }}>
+                    {settings.workStart}–{settings.workEnd}
+                  </span>{" "}
+                  ({settings.graceMinutes} dəq güzəşt), nahar{" "}
+                  <span className="mono" style={{ color: "var(--text)" }}>
+                    {settings.lunchStart}–{settings.lunchEnd}
+                  </span>
+                  {settings.nightShift ? " · gecə növbəsi rejimi aktivdir" : ""}.
+                </>
+              ) : (
+                "Bu bölmədən işçi əlavə edə, silə və şirkətin iş qaydalarını tənzimləyə bilərsən."
+              )}
             </p>
           </div>
 
           <div className="topbar-actions" style={{ display: "flex", gap: 8 }}>
             {view === "kiosk" ? (
-              <button
-                onClick={() => (adminAuthed ? setView("admin") : openAdminGate())}
-                style={btnGhost()}
-              >
+              <button onClick={() => (adminAuthed ? setView("admin") : openAdminGate())} style={btnGhost()}>
                 <ShieldCheck size={15} />
                 Admin Panel
               </button>
@@ -342,6 +395,8 @@ export default function CheckInKiosk() {
             setNewDept={setNewDept}
             addEmployee={addEmployee}
             removeEmployee={removeEmployee}
+            settings={settings}
+            setSettings={setSettings}
           />
         )}
       </div>
@@ -517,12 +572,18 @@ function KioskView({
               padding: "10px 12px",
               borderRadius: 10,
               fontSize: 13,
-              background: flash.danger ? "rgba(232,97,61,0.14)" : flash.late ? "rgba(232,163,61,0.12)" : "rgba(95,191,125,0.12)",
-              border: `1px solid ${flash.danger ? "var(--danger)" : flash.late ? "var(--late)" : "var(--ontime)"}`,
-              color: flash.danger ? "var(--danger)" : flash.late ? "var(--late)" : "var(--ontime)",
+              background: flashBg(flash.variant),
+              border: `1px solid ${flashColor(flash.variant)}`,
+              color: flashColor(flash.variant),
             }}
           >
-            {flash.danger || flash.late ? <AlertTriangle size={16} /> : <CheckCircle2 size={16} />}
+            {flash.variant === "danger" || flash.variant === "late" ? (
+              <AlertTriangle size={16} />
+            ) : flash.variant === "info" ? (
+              <Coffee size={16} />
+            ) : (
+              <CheckCircle2 size={16} />
+            )}
             {flash.msg}
           </div>
         )}
@@ -555,6 +616,19 @@ function KioskView({
   );
 }
 
+function flashBg(variant) {
+  if (variant === "danger") return "rgba(232,97,61,0.14)";
+  if (variant === "late") return "rgba(232,163,61,0.12)";
+  if (variant === "info") return "rgba(77,173,232,0.12)";
+  return "rgba(95,191,125,0.12)";
+}
+function flashColor(variant) {
+  if (variant === "danger") return "var(--danger)";
+  if (variant === "late") return "var(--late)";
+  if (variant === "info") return "var(--info)";
+  return "var(--ontime)";
+}
+
 function StatCard({ label, value, icon, warn }) {
   return (
     <div style={{ background: "var(--panel)", border: "1px solid var(--line)", borderRadius: 14, padding: "14px 16px", minWidth: 0 }}>
@@ -569,10 +643,23 @@ function StatCard({ label, value, icon, warn }) {
   );
 }
 
+const STATUS_BADGE = {
+  ontime: { label: "vaxtında", color: "var(--ontime)", bg: "rgba(95,191,125,0.12)" },
+  late: { label: null, color: "var(--late)", bg: "rgba(232,163,61,0.12)" }, // label dinamik (dəq)
+  halfday: { label: null, color: "var(--danger)", bg: "rgba(232,97,61,0.14)" }, // label dinamik
+  "after-hours": { label: "iş saatından kənar", color: "var(--danger)", bg: "rgba(232,97,61,0.14)" },
+  "lunch-return": { label: "nahardan qayıtdı", color: "var(--info)", bg: "rgba(77,173,232,0.12)" },
+  "lunch-break": { label: "nahar fasiləsi", color: "var(--info)", bg: "rgba(77,173,232,0.12)" },
+  "normal-out": { label: "çıxış", color: "var(--muted)", bg: "transparent" },
+};
+
 function LogRow({ log }) {
   const isIn = log.type === "in";
-  const late = log.status === "late";
-  const afterHours = log.status === "after-hours";
+  const cfg = STATUS_BADGE[log.status] || STATUS_BADGE["normal-out"];
+  let label = cfg.label;
+  if (log.status === "late") label = `${log.lateMinutes} dəq gecikmə`;
+  if (log.status === "halfday") label = `Yarım gün (${log.lateMinutes} dəq)`;
+
   return (
     <div className="log-enter log-row">
       <div
@@ -602,24 +689,19 @@ function LogRow({ log }) {
       <div className="mono" style={{ fontSize: 13, textAlign: "right", minWidth: 70 }}>
         {fmtTime(log.time)}
       </div>
-      <div style={{ minWidth: 130, textAlign: "right" }}>
-        {isIn ? (
-          afterHours ? (
-            <span className="mono" style={{ fontSize: 11, color: "var(--danger)", background: "rgba(232,97,61,0.14)", padding: "3px 8px", borderRadius: 999 }}>
-              iş saatından kənar
-            </span>
-          ) : late ? (
-            <span className="mono" style={{ fontSize: 11, color: "var(--late)", background: "rgba(232,163,61,0.12)", padding: "3px 8px", borderRadius: 999 }}>
-              {log.lateMinutes} dəq gecikmə
-            </span>
-          ) : (
-            <span className="mono" style={{ fontSize: 11, color: "var(--ontime)", background: "rgba(95,191,125,0.12)", padding: "3px 8px", borderRadius: 999 }}>
-              vaxtında
-            </span>
-          )
-        ) : (
-          <span className="mono" style={{ fontSize: 11, color: "var(--muted)" }}>—</span>
-        )}
+      <div style={{ minWidth: 150, textAlign: "right" }}>
+        <span
+          className="mono"
+          style={{
+            fontSize: 11,
+            color: cfg.color,
+            background: cfg.bg,
+            padding: cfg.bg === "transparent" ? 0 : "3px 8px",
+            borderRadius: 999,
+          }}
+        >
+          {label}
+        </span>
       </div>
     </div>
   );
@@ -627,27 +709,55 @@ function LogRow({ log }) {
 
 /* ---------------- ADMIN VIEW ---------------- */
 
-function AdminView({ employees, newName, setNewName, newDept, setNewDept, addEmployee, removeEmployee }) {
+function AdminView({ employees, newName, setNewName, newDept, setNewDept, addEmployee, removeEmployee, settings, setSettings }) {
+  function updateSetting(key, value) {
+    setSettings((prev) => ({ ...prev, [key]: value }));
+  }
+
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+      {/* Şirkət iş qaydaları */}
+      <div style={{ background: "var(--panel)", border: "1px solid var(--line)", borderRadius: 16, padding: 20 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 14, fontSize: 13, color: "var(--muted)" }}>
+          <SlidersHorizontal size={15} />
+          ŞİRKƏT İŞ QAYDALARI
+        </div>
+
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 10 }}>
+          <LabeledInput label="İş başlanğıcı" type="time" value={settings.workStart} onChange={(v) => updateSetting("workStart", v)} />
+          <LabeledInput label="İş bitişi" type="time" value={settings.workEnd} onChange={(v) => updateSetting("workEnd", v)} />
+          <LabeledInput label="Nahar başlanğıcı" type="time" value={settings.lunchStart} onChange={(v) => updateSetting("lunchStart", v)} />
+          <LabeledInput label="Nahar bitişi" type="time" value={settings.lunchEnd} onChange={(v) => updateSetting("lunchEnd", v)} />
+          <LabeledInput
+            label="Gecikmə limiti (dəqiqə)"
+            type="number"
+            value={settings.graceMinutes}
+            onChange={(v) => updateSetting("graceMinutes", v)}
+          />
+          <LabeledInput
+            label="Yarım gün limiti (dəqiqə)"
+            type="number"
+            value={settings.absentMinutes}
+            onChange={(v) => updateSetting("absentMinutes", v)}
+          />
+        </div>
+
+        <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13, color: "var(--muted)", cursor: "pointer" }}>
+          <input type="checkbox" checked={settings.nightShift} onChange={(e) => updateSetting("nightShift", e.target.checked)} />
+          <Moon size={14} />
+          Gecə növbəsi rejimi
+        </label>
+      </div>
+
+      {/* Yeni işçi */}
       <div style={{ background: "var(--panel)", border: "1px solid var(--line)", borderRadius: 16, padding: 20 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 14, fontSize: 13, color: "var(--muted)" }}>
           <UserPlus size={15} />
           YENİ İŞÇİ ƏLAVƏ ET
         </div>
         <div className="admin-form">
-          <input
-            value={newName}
-            onChange={(e) => setNewName(e.target.value)}
-            placeholder="Ad Soyad"
-            style={inputStyle()}
-          />
-          <input
-            value={newDept}
-            onChange={(e) => setNewDept(e.target.value)}
-            placeholder="Şöbə (məs. Anbar)"
-            style={inputStyle()}
-          />
+          <input value={newName} onChange={(e) => setNewName(e.target.value)} placeholder="Ad Soyad" style={inputStyle()} />
+          <input value={newDept} onChange={(e) => setNewDept(e.target.value)} placeholder="Şöbə (məs. Anbar)" style={inputStyle()} />
           <button
             onClick={addEmployee}
             disabled={!newName.trim()}
@@ -673,6 +783,7 @@ function AdminView({ employees, newName, setNewName, newDept, setNewDept, addEmp
         </div>
       </div>
 
+      {/* İşçi siyahısı */}
       <div style={{ background: "var(--panel)", border: "1px solid var(--line)", borderRadius: 16, overflow: "hidden" }}>
         <div style={{ padding: "14px 18px", borderBottom: "1px solid var(--line)", fontSize: 13, color: "var(--muted)", display: "flex", alignItems: "center", gap: 8 }}>
           <Users size={15} />
@@ -725,6 +836,17 @@ function AdminView({ employees, newName, setNewName, newDept, setNewDept, addEmp
           ))
         )}
       </div>
+    </div>
+  );
+}
+
+function LabeledInput({ label, type, value, onChange }) {
+  return (
+    <div>
+      <label className="mono" style={{ fontSize: 10, color: "var(--muted)", letterSpacing: 0.5, display: "block", marginBottom: 4 }}>
+        {label.toUpperCase()}
+      </label>
+      <input type={type} value={value} onChange={(e) => onChange(e.target.value)} style={inputStyle()} />
     </div>
   );
 }
