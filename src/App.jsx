@@ -1,12 +1,12 @@
-import React, { useState, useRef, useMemo } from "react";
+import React, { useState, useMemo, useEffect } from "react";
 import {
-  Fingerprint,
+  Camera,
+  CameraOff,
+  ScanFace,
   LogIn,
   LogOut,
-  Clock,
-  CheckCircle2,
   AlertTriangle,
-  ChevronDown,
+  CheckCircle2,
   Settings2,
   ShieldCheck,
   Lock,
@@ -15,921 +15,1892 @@ import {
   ArrowLeft,
   Users,
   Moon,
-  Coffee,
   SlidersHorizontal,
+  Download,
+  X,
+  ChevronDown,
+  XCircle,
+  KeyRound,
+  ClipboardList,
+  Wallet,
+  Clock,
 } from "lucide-react";
+import "./App.css";
+import { useCamera } from "./Camera";
+import {
+  dbGet,
+  dbSet,
+  verifyPassword,
+  changePassword,
+  isDefaultPassword,
+  DEFAULT_PASSWORD,
+} from "./Storage";
+import {
+  faceapi,
+  loadModels,
+  recognize,
+  detectWithDescriptors,
+  takeSnapshot,
+  sleep,
+} from "./Face";
+import {
+  DEFAULT_SETTINGS,
+  STATUS_TEXT,
+  fmtTime,
+  initialsFor,
+  uid,
+  effectiveRules,
+  isWorkingDay,
+  resolveStatus,
+  groupLogs,
+  dateKey,
+  toMinutes,
+  fmtDuration,
+} from "./Attandance";
 
-// ---- ID sabiti ----
-const ADMIN_PASSWORD = "admin123"; // demo üçün sadə parol
+const MAX_SAMPLES = 5;
+const RESULT_MS = 6000;
 
-const INITIAL_EMPLOYEES = [
-  { id: "e1", name: "Rəşad Əliyev", dept: "İstehsalat", initials: "RƏ" },
-  { id: "e2", name: "Günel Məmmədova", dept: "Anbar", initials: "GM" },
-  { id: "e3", name: "Tural Hüseynov", dept: "Nəqliyyat", initials: "TH" },
-  { id: "e4", name: "Aynur Quliyeva", dept: "Ofis", initials: "AQ" },
+const REASONS = [
+  "Rəhbərlikdən icazə aldım",
+  "Rəsmi iş / ezamiyyət",
+  "Sağlamlıq",
+  "Şəxsi iş",
+  "Digər",
 ];
-
-// ---- Şirkət iş qaydalarının default dəyərləri ----
-const DEFAULT_SETTINGS = {
-  workStart: "09:00",
-  workEnd: "18:00",
-  lunchStart: "13:00",
-  lunchEnd: "14:00",
-  graceMinutes: 15,
-  absentMinutes: 120,
-  nightShift: false,
+const APPROVAL_TEXT = {
+  none: "səbəb göstərilməyib",
+  pending: "təsdiq gözləyir",
+  approved: "təsdiqləndi",
+  rejected: "rədd edildi",
 };
+const EXTRA_STATUS = { back: "Çöldən qayıtdı" };
 
-function fmtTime(d) {
-  return d.toLocaleTimeString("az-AZ", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+const money = (n) =>
+  `${(Math.round((Number(n) || 0) * 100) / 100).toFixed(2)} ₼`;
+
+// Hər başlanmış gecikmə bloku (standart 30 dəq) üçün cərimə (standart 0.10 ₼)
+function penaltyFor(lateMin, s) {
+  const block = Math.max(1, Number(s.penaltyBlock) || 30);
+  const rate = Number(s.penaltyRate ?? 0.1) || 0;
+  return lateMin > 0 ? Math.ceil(lateMin / block) * rate : 0;
 }
 
-function initialsFor(name) {
-  const parts = name.trim().split(/\s+/).filter(Boolean);
-  if (parts.length === 0) return "??";
-  if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
-  return (parts[0][0] + parts[1][0]).toUpperCase();
+// Bir işçinin seçilmiş ay üzrə gecikmə və cərimə göstəriciləri (hər günün ilk girişi)
+function monthStats(emp, groups, month, settings) {
+  let present = 0,
+    lateDays = 0,
+    lateMin = 0,
+    penalty = 0;
+  const rows = [];
+  for (const [k, ev] of groups) {
+    const [id, day] = k.split("|");
+    if (id !== emp.id || !day.startsWith(month)) continue;
+    const first = ev.find((x) => x.type === "in");
+    if (!first) continue;
+    present++;
+    if (first.status === "late" || first.status === "halfday") {
+      const p = penaltyFor(first.lateMinutes, settings);
+      lateDays++;
+      lateMin += first.lateMinutes;
+      penalty += p;
+      rows.push({ day, min: first.lateMinutes, p });
+    }
+  }
+  rows.sort((a, b) => (a.day < b.day ? 1 : -1));
+  return { present, lateDays, lateMin, penalty, rows };
 }
 
-function toMinutes(hhmm) {
-  const [h, m] = (hhmm || "00:00").split(":").map(Number);
-  return h * 60 + (m || 0);
-}
-
-// Skan vaxtına və şirkət qaydalarına əsasən status müəyyən edir
-// (köhnə vanilla-JS versiyasındakı processAttendance məntiqinin React qarşılığı)
-function resolveStatus(time, type, settings) {
-  const workStartMin = toMinutes(settings.workStart);
-  const workEndMin = toMinutes(settings.workEnd);
-  const lunchStartMin = toMinutes(settings.lunchStart);
-  const lunchEndMin = toMinutes(settings.lunchEnd);
-  const grace = Number(settings.graceMinutes) || 0;
-  const absentLimit = Number(settings.absentMinutes) || 0;
-
-  let nowMin = time.getHours() * 60 + time.getMinutes();
-  // Gecə növbəsi: yarımgecədən sonrakı saatları növbənin davamı kimi say
-  if (settings.nightShift && nowMin < workStartMin - 240) {
-    nowMin += 1440;
-  }
-
-  const inLunchWindow = nowMin >= lunchStartMin && nowMin <= lunchEndMin;
-  const afterHours = nowMin >= workEndMin;
-
-  if (type === "out") {
-    return { status: inLunchWindow ? "lunch-break" : "normal-out", lateMinutes: 0 };
-  }
-
-  // type === "in"
-  if (inLunchWindow) return { status: "lunch-return", lateMinutes: 0 };
-  if (afterHours) return { status: "after-hours", lateMinutes: 0 };
-
-  const diff = nowMin - workStartMin;
-  if (diff <= grace) return { status: "ontime", lateMinutes: 0 };
-  if (diff <= absentLimit) return { status: "late", lateMinutes: diff };
-  return { status: "halfday", lateMinutes: diff };
-}
-
-const CSS = `
-  *{ box-sizing:border-box; margin:0; padding:0; }
-  .kiosk-root{ font-family:'Inter', ui-sans-serif, system-ui, -apple-system, sans-serif; }
-  .mono{ font-family:'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace; }
-
-  @keyframes sweep {
-    0% { transform: translateY(-100%); opacity: 0; }
-    15% { opacity: 1; }
-    85% { opacity: 1; }
-    100% { transform: translateY(100%); opacity: 0; }
-  }
-  @keyframes pulseRing {
-    0% { transform: scale(0.9); opacity: 0.7; }
-    100% { transform: scale(1.6); opacity: 0; }
-  }
-  @keyframes fadeSlide {
-    from { opacity: 0; transform: translateY(-6px); }
-    to { opacity: 1; transform: translateY(0); }
-  }
-  @keyframes shake {
-    0%, 100% { transform: translateX(0); }
-    25% { transform: translateX(-6px); }
-    75% { transform: translateX(6px); }
-  }
-  .log-enter{ animation: fadeSlide 0.35s ease-out; }
-  .shake{ animation: shake 0.32s ease-in-out; }
-  .scan-btn:focus-visible{ outline: 2px solid var(--scan); outline-offset: 3px; }
-
-  .layout-grid{
-    display: grid;
-    grid-template-columns: 340px 1fr;
-    gap: 20px;
-  }
-  .stat-grid{
-    display: grid;
-    grid-template-columns: 1fr 1fr 1fr;
-    gap: 12px;
-  }
-  .log-row{
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    padding: 12px 18px;
-    border-bottom: 1px solid var(--line);
-    flex-wrap: wrap;
-  }
-  .log-dept{ display:block; }
-  .topbar{
-    display:flex;
-    align-items:flex-start;
-    justify-content:space-between;
-    gap:12px;
-    flex-wrap:wrap;
-    margin-bottom: 28px;
-  }
-  .admin-table-row{
-    display:flex;
-    align-items:center;
-    gap:12px;
-    padding:12px 16px;
-    border-bottom:1px solid var(--line);
-  }
-  .admin-form{
-    display:grid;
-    grid-template-columns: 1fr 1fr auto;
-    gap: 10px;
-  }
-
-  @media (max-width: 820px){
-    .layout-grid{ grid-template-columns: 1fr; }
-  }
-  @media (max-width: 560px){
-    .kiosk-root{ padding: 20px 12px !important; }
-    .stat-grid{ grid-template-columns: 1fr 1fr; }
-    .stat-grid > div:last-child{ grid-column: span 2; }
-    h1{ font-size: 21px !important; }
-    .scanner-panel{ padding: 18px !important; }
-    .log-dept{ display:none; }
-    .admin-form{ grid-template-columns: 1fr; }
-    .topbar{ flex-direction: column; }
-    .topbar-actions{ width:100%; }
-    .topbar-actions button{ flex:1; }
-  }
-`;
+/* ================= Əsas komponent ================= */
 
 export default function CheckInKiosk() {
-  const [employees, setEmployees] = useState(INITIAL_EMPLOYEES);
-  const [selectedEmp, setSelectedEmp] = useState(INITIAL_EMPLOYEES[0].id);
+  const [employees, setEmployees] = useState([]);
   const [logs, setLogs] = useState([]);
-  const [scanning, setScanning] = useState(false);
-  const [flash, setFlash] = useState(null);
+  const [settings, setSettings] = useState(DEFAULT_SETTINGS);
+  const [loaded, setLoaded] = useState(false);
+  const [storeError, setStoreError] = useState("");
+
+  const [models, setModels] = useState("loading");
+  const [busy, setBusy] = useState(null); // null | countdown | verifying
+  const [count, setCount] = useState(0);
+  const [prompt, setPrompt] = useState("");
+  const [result, setResult] = useState(null);
+  const [face, setFace] = useState({ found: false, count: 0 });
+
+  // Test vaxtı admin paneldən idarə olunur
   const [useCustomTime, setUseCustomTime] = useState(false);
   const [customTime, setCustomTime] = useState("09:00");
-  const timeoutRef = useRef(null);
 
-  // Şirkət iş qaydaları (əvvəlki HTML versiyasındakı burger-menyu tənzimləmələri)
-  const [settings, setSettings] = useState(DEFAULT_SETTINGS);
-
-  // görünüş: 'kiosk' | 'admin'
   const [view, setView] = useState("kiosk");
   const [adminAuthed, setAdminAuthed] = useState(false);
   const [showGate, setShowGate] = useState(false);
-  const [pwInput, setPwInput] = useState("");
-  const [pwError, setPwError] = useState(false);
+  const [enrollId, setEnrollId] = useState(null);
 
-  // admin forması (yeni işçi)
-  const [newName, setNewName] = useState("");
-  const [newDept, setNewDept] = useState("");
+  const cam = useCamera();
 
-  const emp = employees.find((e) => e.id === selectedEmp) || employees[0];
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      try {
+        const [e, l, s] = await Promise.all([
+          dbGet("employees"),
+          dbGet("logs"),
+          dbGet("settings"),
+        ]);
+        if (!alive) return;
+        if (e) setEmployees(e);
+        if (l) setLogs(l);
+        if (s) setSettings({ ...DEFAULT_SETTINGS, ...s });
+      } catch {
+        if (alive)
+          setStoreError(
+            "Yaddaş oxuna bilmədi. Məlumatlar bu sessiyadan sonra itə bilər.",
+          );
+      } finally {
+        if (alive) setLoaded(true);
+      }
+    })();
+    navigator.storage?.persist?.();
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  const saveFail = () =>
+    setStoreError(
+      "Yaddaşa yazmaq mümkün olmadı (yer bitmiş ola bilər). Köhnə qeydləri CSV-yə çıxarıb sil.",
+    );
+  useEffect(() => {
+    if (loaded) dbSet("employees", employees).catch(saveFail);
+  }, [employees, loaded]);
+  useEffect(() => {
+    if (loaded) dbSet("logs", logs).catch(saveFail);
+  }, [logs, loaded]);
+  useEffect(() => {
+    if (loaded) dbSet("settings", settings).catch(saveFail);
+  }, [settings, loaded]);
+
+  useEffect(() => {
+    let alive = true;
+    loadModels()
+      .then(() => alive && setModels("ready"))
+      .catch(() => alive && setModels("error"));
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (view === "kiosk") cam.start();
+    else cam.stop();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [view]);
+
+  // Nəticə bir neçə saniyədən sonra silinir
+  useEffect(() => {
+    if (!result) return;
+    const t = setTimeout(
+      () => setResult(null),
+      result.askReason ? 20000 : RESULT_MS,
+    );
+    return () => clearTimeout(t);
+  }, [result]);
+
+  // Canlı üz izləmə
+  useEffect(() => {
+    if (
+      view !== "kiosk" ||
+      cam.state !== "ready" ||
+      models !== "ready" ||
+      busy
+    ) {
+      if (!busy) setFace({ found: false, count: 0 });
+      return;
+    }
+    let alive = true;
+    let running = false;
+    const id = setInterval(async () => {
+      const v = cam.videoRef.current;
+      if (running || !v || v.readyState < 2) return;
+      running = true;
+      try {
+        const faces = await faceapi.detectAllFaces(
+          v,
+          new faceapi.TinyFaceDetectorOptions({
+            inputSize: 224,
+            scoreThreshold: 0.5,
+          }),
+        );
+        if (alive) setFace({ found: faces.length > 0, count: faces.length });
+      } catch {
+        /* diqqətə alma */
+      }
+      running = false;
+    }, 500);
+    return () => {
+      alive = false;
+      clearInterval(id);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [view, cam.state, models, busy]);
 
   const lastActionByEmp = useMemo(() => {
     const map = {};
-    for (const l of logs) map[l.employeeId] = l.type;
+    for (const l of logs)
+      if (l.type !== "denied" && !(l.employeeId in map))
+        map[l.employeeId] = l.type;
     return map;
   }, [logs]);
 
+  const enrolled = useMemo(
+    () => employees.filter((e) => e.descriptors?.length),
+    [employees],
+  );
+
   function resolveScanTime() {
-    const now = new Date();
     if (useCustomTime && /^\d{2}:\d{2}$/.test(customTime)) {
       const [h, m] = customTime.split(":").map(Number);
       const d = new Date();
       d.setHours(h, m, Math.floor(Math.random() * 50), 0);
       return d;
     }
-    return now;
+    return new Date();
   }
 
-  function handleScan() {
-    if (scanning || !emp) return;
-    setScanning(true);
-    setFlash(null);
-    timeoutRef.current = setTimeout(() => {
-      const time = resolveScanTime();
-      const lastType = lastActionByEmp[emp.id];
-      const type = lastType === "in" ? "out" : "in";
-      const { status, lateMinutes } = resolveStatus(time, type, settings);
+  async function handleScan() {
+    if (busy) return;
+    setResult(null);
+    const err = (msg) =>
+      setResult({ kind: "error", title: "Yoxlama alınmadı", msg });
 
-      const entry = {
-        id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+    if (models !== "ready") return err("Üz tanıma modeli hələ yüklənməyib.");
+    if (cam.state !== "ready") return err("Kamera aktiv deyil.");
+    if (enrolled.length === 0)
+      return err(
+        "Qeydiyyatlı üz yoxdur. Administrator işçi üzü əlavə etməlidir.",
+      );
+
+    setBusy("countdown");
+    const secs = Math.max(0, Math.min(5, Number(settings.countdown) || 0));
+    for (let i = secs; i > 0; i--) {
+      setCount(i);
+      await sleep(800);
+    }
+    setCount(0);
+    setBusy("verifying");
+    setPrompt("");
+
+    let res;
+    try {
+      res = await recognize(
+        cam.videoRef.current,
+        enrolled,
+        Number(settings.matchThreshold) || 0.5,
+        {
+          liveness: settings.liveness || "off",
+          onPrompt: setPrompt,
+        },
+      );
+    } catch {
+      res = {
+        kind: "fail",
+        msg: "Üz yoxlaması zamanı xəta baş verdi. Yenidən cəhd et.",
+      };
+    }
+    setPrompt("");
+
+    if (res.kind === "fail") {
+      setBusy(null);
+      return err(res.msg);
+    }
+
+    const photo = settings.saveSnapshots ? res.photo : null;
+    const createdAt = Date.now();
+
+    if (res.kind === "unknown") {
+      setLogs((prev) => [
+        {
+          id: uid(),
+          employeeId: null,
+          employeeName: "Tanınmayan şəxs",
+          initials: "?",
+          dept: "",
+          type: "denied",
+          time: new Date(createdAt),
+          createdAt,
+          lateMinutes: 0,
+          status: "unknown",
+          photo,
+        },
+        ...prev,
+      ]);
+      setBusy(null);
+      return setResult({
+        kind: "denied",
+        title: "Girmədi",
+        msg: "Üz qeydiyyatlı işçilərə uyğun gəlmir.",
+        photo: res.photo,
+      });
+    }
+
+    const emp = res.emp;
+    const cooldown = Math.max(0, Number(settings.cooldownSec) || 0) * 1000;
+    const recent = logs.find(
+      (l) => l.employeeId === emp.id && l.type !== "denied",
+    );
+    if (recent && createdAt - (recent.createdAt || 0) < cooldown) {
+      setBusy(null);
+      return setResult({
+        kind: "info",
+        title: emp.name,
+        msg: "Artıq qeydə alınıb. Bir neçə saniyə sonra yenidən cəhd et.",
+        photo: res.photo,
+      });
+    }
+
+    const time = resolveScanTime();
+    const type = lastActionByEmp[emp.id] === "in" ? "out" : "in";
+    const rules = effectiveRules(emp, settings);
+    const working = isWorkingDay(time, settings, []);
+    let { status, lateMinutes } = resolveStatus(time, type, rules, working);
+
+    // Eyni gün çıxıb qayıdırsa, bu yeni "gecikmə" sayılmır
+    const isReturn =
+      type === "in" &&
+      recent?.type === "out" &&
+      dateKey(new Date(recent.time)) === dateKey(time);
+    if (isReturn && ["ontime", "late", "halfday"].includes(status)) {
+      status = recent.status === "lunch-break" ? "lunch-return" : "back";
+      lateMinutes = 0;
+    }
+
+    // İş saatları ərzində (nahar və iş günü sonu istisna) çıxış
+    const nowMin = time.getHours() * 60 + time.getMinutes();
+    const midDay =
+      type === "out" &&
+      status === "normal-out" &&
+      working &&
+      !rules.nightShift &&
+      nowMin < toMinutes(rules.workEnd);
+    const logId = uid();
+
+    setLogs((prev) => [
+      {
+        id: logId,
         employeeId: emp.id,
         employeeName: emp.name,
         initials: emp.initials,
         dept: emp.dept,
         type,
         time,
+        createdAt,
         lateMinutes,
         status,
-      };
-      setLogs((prev) => [entry, ...prev]);
-      setScanning(false);
+        photo,
+        midDay,
+        reason: null,
+        approval: midDay ? "none" : null,
+      },
+      ...prev,
+    ]);
+    setBusy(null);
 
-      const msgMap = {
-        ontime: `${emp.name} vaxtında daxil oldu`,
-        late: `${emp.name} daxil oldu — ${lateMinutes} dəq gecikmə`,
-        halfday: `${emp.name} çox gec gəldi — yarım gün sayılır (${lateMinutes} dəq gecikmə)`,
-        "after-hours": `${emp.name} — iş günü artıq bitib, bu giriş qeyri-adi sayılır`,
-        "lunch-return": `${emp.name} nahardan qayıtdı`,
-        "lunch-break": `${emp.name} nahar fasiləsinə çıxdı`,
-        "normal-out": `${emp.name} çıxış etdi`,
-      };
-
-      setFlash({
-        msg: msgMap[status] || `${emp.name} qeydə alındı`,
-        variant:
-          status === "halfday" || status === "after-hours"
-            ? "danger"
-            : status === "late"
-            ? "late"
-            : status === "lunch-return" || status === "lunch-break"
-            ? "info"
-            : "ontime",
-      });
-    }, 1400);
-  }
-
-  function openAdminGate() {
-    setPwInput("");
-    setPwError(false);
-    setShowGate(true);
-  }
-
-  function submitPassword() {
-    if (pwInput === ADMIN_PASSWORD) {
-      setAdminAuthed(true);
-      setShowGate(false);
-      setView("admin");
-    } else {
-      setPwError(true);
+    // Qayıdışda çöldə olma müddəti
+    let away = "";
+    if (isReturn) {
+      const mins = Math.max(0, (time - new Date(recent.time)) / 60000);
+      if (recent.midDay) {
+        away = `Çöldə olduğunuz müddət: ${fmtDuration(mins)}. Səbəb: ${recent.reason || "göstərilməyib"} (${APPROVAL_TEXT[recent.approval] || "göstərilməyib"}).`;
+      } else if (recent.status === "lunch-break") {
+        away = `Nahar fasiləsi bitdi. Fasilə müddəti: ${fmtDuration(mins)}.`;
+      }
     }
+
+    const pen =
+      status === "late" || status === "halfday"
+        ? penaltyFor(lateMinutes, settings)
+        : 0;
+    const lateTxt = `${lateMinutes} dəq gecikmə qeyd olundu. Cərimə: ${money(pen)}.`;
+    const MSG = {
+      ontime: "Uğurlu iş günü!",
+      late: lateTxt,
+      halfday: `Çox gec gəldiniz, yarım gün sayılır. ${lateTxt}`,
+      "after-hours": "İş günü bitib, bu giriş qeyri-adi kimi qeyd edildi.",
+      dayoff: "Bu gün istirahət günüdür, giriş qeyd edildi.",
+      "lunch-break": `Nahar fasiləsi başladı. Qayıdış vaxtı: ${rules.lunchEnd}.`,
+      "normal-out": midDay
+        ? `Normal iş saatı ${rules.workEnd}-də bitir. Çıxış səbəbini seçin.`
+        : "Çıxış qeyd olundu.",
+    };
+    const first = emp.name.split(" ")[0];
+    const title =
+      type === "in"
+        ? `Xoş gəl${isReturn ? "diniz" : "misiniz"}, ${first}!`
+        : status === "lunch-break"
+          ? `Xoş istirahətlər, ${first}!`
+          : midDay
+            ? `${first}, iş saatları ərzində çıxdınız`
+            : `Sağ olun, ${first}!`;
+
+    setResult({
+      kind: type,
+      title,
+      name: emp.name,
+      dept: emp.dept,
+      msg: away || MSG[status] || "",
+      warn: ["late", "halfday", "after-hours"].includes(status) || midDay,
+      time,
+      photo: res.photo,
+      askReason: midDay,
+      logId,
+    });
   }
 
-  function addEmployee() {
-    const name = newName.trim();
-    const dept = newDept.trim() || "Təyin edilməyib";
-    if (!name) return;
-    const newEmp = { id: `emp-${Date.now()}`, name, dept, initials: initialsFor(name) };
-    setEmployees((prev) => [...prev, newEmp]);
-    setNewName("");
-    setNewDept("");
+  function submitReason(logId, reason) {
+    setLogs((prev) =>
+      prev.map((l) =>
+        l.id === logId ? { ...l, reason, approval: "pending" } : l,
+      ),
+    );
+    setResult(
+      (r) =>
+        r && {
+          ...r,
+          askReason: false,
+          msg: `Səbəb qeyd olundu: ${reason}. Admin təsdiqi gözlənilir.`,
+        },
+    );
+  }
+
+  /* ---------- Admin əməliyyatları ---------- */
+
+  const deleteLog = (id) => setLogs((prev) => prev.filter((l) => l.id !== id));
+  const clearLogs = () => {
+    if (
+      window.confirm(
+        "Bütün giriş-çıxış jurnalı silinsin? Bu əməliyyat geri qaytarılmır.",
+      )
+    )
+      setLogs([]);
+  };
+
+  function exportCsv() {
+    const head = ["Ad", "Şöbə", "Növ", "Vaxt", "Status", "Gecikmə (dəq)"];
+    const rows = [...logs]
+      .reverse()
+      .map((l) => [
+        l.employeeName,
+        l.dept,
+        l.type === "in" ? "Giriş" : l.type === "out" ? "Çıxış" : "Rədd edildi",
+        new Date(l.time).toLocaleString("az-AZ"),
+        STATUS_TEXT[l.status] || EXTRA_STATUS[l.status] || l.status,
+        l.lateMinutes,
+      ]);
+    const csv = [head, ...rows]
+      .map((r) => r.map((c) => `"${String(c).replace(/"/g, '""')}"`).join(","))
+      .join("\n");
+    const url = URL.createObjectURL(
+      new Blob(["\ufeff" + csv], { type: "text/csv;charset=utf-8" }),
+    );
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `davamiyyet-${new Date().toISOString().slice(0, 10)}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  function addEmployee(name, dept) {
+    const id = `emp-${Date.now()}`;
+    setEmployees((prev) => [
+      ...prev,
+      {
+        id,
+        name,
+        dept: dept || "Təyin edilməyib",
+        initials: initialsFor(name),
+        descriptors: [],
+        avatar: null,
+        createdAt: Date.now(),
+      },
+    ]);
+    setEnrollId(id);
   }
 
   function removeEmployee(id) {
-    setEmployees((prev) => prev.filter((e) => e.id !== id));
-    if (selectedEmp === id) {
-      const remaining = employees.filter((e) => e.id !== id);
-      setSelectedEmp(remaining[0]?.id || "");
-    }
+    const e = employees.find((x) => x.id === id);
+    if (
+      !window.confirm(
+        `${e?.name || "İşçi"} silinsin? Üz məlumatı da silinəcək, jurnal qeydləri qalacaq.`,
+      )
+    )
+      return;
+    setEmployees((prev) => prev.filter((x) => x.id !== id));
   }
 
-  const todayLate = logs.filter((l) => l.type === "in" && (l.status === "late" || l.status === "halfday")).length;
-  const todayIn = logs.filter((l) => l.type === "in").length;
+  function clearFace(id) {
+    if (!window.confirm("Bu işçinin üz məlumatı silinsin?")) return;
+    setEmployees((prev) =>
+      prev.map((e) =>
+        e.id === id ? { ...e, descriptors: [], avatar: null } : e,
+      ),
+    );
+  }
+
+  function saveEnrollment(id, samples) {
+    setEmployees((prev) =>
+      prev.map((e) =>
+        e.id === id
+          ? {
+              ...e,
+              descriptors: samples.map((s) => s.descriptor),
+              avatar: samples[0]?.photo || null,
+            }
+          : e,
+      ),
+    );
+    setEnrollId(null);
+  }
+
+  const updateEmployee = (id, patch) =>
+    setEmployees((prev) =>
+      prev.map((e) => (e.id === id ? { ...e, ...patch } : e)),
+    );
+  const setApproval = (id, approval, note) =>
+    setLogs((prev) =>
+      prev.map((l) =>
+        l.id === id ? { ...l, approval, adminNote: note ?? l.adminNote } : l,
+      ),
+    );
+
+  const enrollEmp = employees.find((e) => e.id === enrollId);
 
   return (
-    <div
-      className="kiosk-root"
-      style={{
-        "--bg": "#12171c",
-        "--panel": "#1a2129",
-        "--panel-2": "#212a33",
-        "--line": "#2b3540",
-        "--scan": "#45d6bd",
-        "--ontime": "#5fbf7d",
-        "--late": "#e8a33d",
-        "--danger": "#e8613d",
-        "--info": "#4dade8",
-        "--text": "#e7edf0",
-        "--muted": "#8695a0",
-        background: "var(--bg)",
-        color: "var(--text)",
-        minHeight: "100vh",
-        padding: "32px 16px",
-        position: "relative",
-      }}
-    >
-      <style>{CSS}</style>
-
-      <div style={{ maxWidth: 960, margin: "0 auto" }}>
-        {/* Üst panel */}
-        <div className="topbar">
+    <div className="ck">
+      <div className="ck-wrap">
+        <div className="ck-topbar">
           <div>
-            <div className="mono" style={{ color: "var(--scan)", fontSize: 12, letterSpacing: 2, marginBottom: 6 }}>
-              KEÇİD-NƏZARƏT TERMİNALI · DEMO
-            </div>
-            <h1 style={{ fontSize: 26, fontWeight: 700, margin: 0 }}>
-              {view === "kiosk" ? "İşçi Giriş / Çıxış Sistemi" : "Admin Panel"}
+            <h1 className="ck-title">
+              {view === "kiosk" ? "İşçi giriş və çıxış sistemi" : "Admin panel"}
             </h1>
-            <p style={{ color: "var(--muted)", fontSize: 14, marginTop: 6, maxWidth: 480 }}>
-              {view === "kiosk" ? (
-                <>
-                  Barmaq izi ilə giriş-çıxış izlənməsi. İş saatı{" "}
-                  <span className="mono" style={{ color: "var(--text)" }}>
-                    {settings.workStart}–{settings.workEnd}
-                  </span>{" "}
-                  ({settings.graceMinutes} dəq güzəşt), nahar{" "}
-                  <span className="mono" style={{ color: "var(--text)" }}>
-                    {settings.lunchStart}–{settings.lunchEnd}
-                  </span>
-                  {settings.nightShift ? " · gecə növbəsi rejimi aktivdir" : ""}.
-                </>
-              ) : (
-                "Bu bölmədən işçi əlavə edə, silə və şirkətin iş qaydalarını tənzimləyə bilərsən."
-              )}
+            <p className="ck-sub">
+              {view === "kiosk"
+                ? "Düyməyə bas və kameraya düz bax. Nəticə ekranda görünəcək."
+                : "İşçiləri, jurnalı və iş qaydalarını yalnız bu bölmədən idarə etmək olar."}
             </p>
           </div>
-
-          <div className="topbar-actions" style={{ display: "flex", gap: 8 }}>
-            {view === "kiosk" ? (
-              <button onClick={() => (adminAuthed ? setView("admin") : openAdminGate())} style={btnGhost()}>
-                <ShieldCheck size={15} />
-                Admin Panel
-              </button>
-            ) : (
-              <button onClick={() => setView("kiosk")} style={btnGhost()}>
-                <ArrowLeft size={15} />
-                Terminala qayıt
-              </button>
-            )}
-          </div>
+          {view === "kiosk" ? (
+            <button
+              className="ck-btn"
+              onClick={() =>
+                adminAuthed ? setView("admin") : setShowGate(true)
+              }
+            >
+              <ShieldCheck size={15} />
+              Admin
+            </button>
+          ) : (
+            <button className="ck-btn" onClick={() => setView("kiosk")}>
+              <ArrowLeft size={15} />
+              Terminala qayıt
+            </button>
+          )}
         </div>
+
+        {storeError && <div className="ck-warn">{storeError}</div>}
 
         {view === "kiosk" ? (
           <KioskView
-            employees={employees}
-            selectedEmp={selectedEmp}
-            setSelectedEmp={setSelectedEmp}
-            scanning={scanning}
+            models={models}
+            busy={busy}
+            count={count}
+            prompt={prompt}
             handleScan={handleScan}
-            useCustomTime={useCustomTime}
-            setUseCustomTime={setUseCustomTime}
-            customTime={customTime}
-            setCustomTime={setCustomTime}
-            flash={flash}
-            logs={logs}
-            todayIn={todayIn}
-            todayLate={todayLate}
+            result={result}
+            cam={cam}
+            face={face}
+            onReason={submitReason}
+            onSkip={() => setResult((r) => r && { ...r, askReason: false })}
           />
         ) : (
           <AdminView
             employees={employees}
-            newName={newName}
-            setNewName={setNewName}
-            newDept={newDept}
-            setNewDept={setNewDept}
-            addEmployee={addEmployee}
-            removeEmployee={removeEmployee}
+            logs={logs}
             settings={settings}
             setSettings={setSettings}
+            addEmployee={addEmployee}
+            removeEmployee={removeEmployee}
+            clearFace={clearFace}
+            onEnroll={setEnrollId}
+            deleteLog={deleteLog}
+            clearLogs={clearLogs}
+            exportCsv={exportCsv}
+            updateEmployee={updateEmployee}
+            setApproval={setApproval}
+            useCustomTime={useCustomTime}
+            setUseCustomTime={setUseCustomTime}
+            customTime={customTime}
+            setCustomTime={setCustomTime}
           />
         )}
       </div>
 
+      {enrollEmp && (
+        <EnrollModal
+          emp={enrollEmp}
+          models={models}
+          onSave={saveEnrollment}
+          onClose={() => setEnrollId(null)}
+        />
+      )}
       {showGate && (
         <PasswordGate
-          pwInput={pwInput}
-          setPwInput={setPwInput}
-          pwError={pwError}
-          onSubmit={submitPassword}
           onClose={() => setShowGate(false)}
+          onSuccess={() => {
+            setAdminAuthed(true);
+            setShowGate(false);
+            setView("admin");
+          }}
         />
       )}
     </div>
   );
 }
 
-function btnGhost() {
-  return {
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "center",
-    gap: 6,
-    background: "var(--panel-2)",
-    border: "1px solid var(--line)",
-    color: "var(--text)",
-    borderRadius: 10,
-    padding: "9px 14px",
-    fontSize: 13,
-    cursor: "pointer",
-  };
-}
-
-/* ---------------- KIOSK VIEW ---------------- */
+/* ================= Kiosk: yalnız skan və nəticə ================= */
 
 function KioskView({
-  employees,
-  selectedEmp,
-  setSelectedEmp,
-  scanning,
+  models,
+  busy,
+  count,
+  prompt,
   handleScan,
-  useCustomTime,
-  setUseCustomTime,
-  customTime,
-  setCustomTime,
-  flash,
-  logs,
-  todayIn,
-  todayLate,
+  result,
+  cam,
+  face,
+  onReason,
+  onSkip,
 }) {
+  const ready = cam.state === "ready";
+  const viewClass = busy
+    ? "work"
+    : result?.kind === "denied" || result?.kind === "error"
+      ? "fail"
+      : ready && face.found
+        ? "found"
+        : "";
+
+  let chipText = "";
+  if (models === "loading") chipText = "Üz tanıma modeli yüklənir...";
+  else if (busy === "verifying") chipText = prompt || "Üz yoxlanılır...";
+  else if (busy === "countdown") chipText = "Kameraya düz bax";
+  else if (ready)
+    chipText =
+      face.count > 1
+        ? "Kadrda bir nəfər olmalıdır"
+        : face.found
+          ? "Üz tapıldı"
+          : "Üz axtarılır";
+
+  const btnText =
+    busy === "countdown"
+      ? "Hazır ol..."
+      : busy === "verifying"
+        ? "Yoxlanılır..."
+        : "Üzü yoxla";
+
   return (
-    <div className="layout-grid">
-      {/* Skan paneli */}
-      <div
-        className="scanner-panel"
-        style={{
-          background: "var(--panel)",
-          border: "1px solid var(--line)",
-          borderRadius: 16,
-          padding: 24,
-          display: "flex",
-          flexDirection: "column",
-          alignItems: "center",
-          gap: 18,
-        }}
-      >
-        <div style={{ width: "100%", position: "relative" }}>
-          <label className="mono" style={{ fontSize: 11, color: "var(--muted)", letterSpacing: 1 }}>
-            İŞÇİNİ SEÇ (DEMO ÜÇÜN)
-          </label>
-          <div style={{ position: "relative", marginTop: 6 }}>
-            <select
-              value={selectedEmp}
-              onChange={(e) => setSelectedEmp(e.target.value)}
-              disabled={scanning || employees.length === 0}
-              style={{
-                width: "100%",
-                appearance: "none",
-                background: "var(--panel-2)",
-                border: "1px solid var(--line)",
-                color: "var(--text)",
-                borderRadius: 10,
-                padding: "10px 34px 10px 12px",
-                fontSize: 14,
-                cursor: "pointer",
-              }}
-            >
-              {employees.length === 0 && <option value="">İşçi yoxdur</option>}
-              {employees.map((e) => (
-                <option key={e.id} value={e.id}>
-                  {e.name} — {e.dept}
-                </option>
-              ))}
-            </select>
-            <ChevronDown
-              size={16}
-              style={{ position: "absolute", right: 10, top: "50%", transform: "translateY(-50%)", color: "var(--muted)", pointerEvents: "none" }}
-            />
+    <div
+      className="ck-card ck-pad ck-col"
+      style={{ maxWidth: 560, margin: "0 auto", width: "100%" }}
+    >
+      <div className={`ck-view ${viewClass}`}>
+        <video ref={cam.videoRef} className="ck-video" playsInline muted />
+        {ready && (
+          <>
+            <span className="ck-corner tl" />
+            <span className="ck-corner tr" />
+            <span className="ck-corner bl" />
+            <span className="ck-corner br" />
+            {busy === "verifying" && <span className="ck-scanline" />}
+            {busy === "countdown" && count > 0 && (
+              <div className="ck-count">{count}</div>
+            )}
+            {chipText && (
+              <div className="ck-chip">
+                <span className="ck-dot" />
+                {chipText}
+              </div>
+            )}
+          </>
+        )}
+        {cam.state === "starting" && (
+          <div className="ck-overlay">
+            <Camera size={30} />
+            <span>Kamera açılır...</span>
           </div>
-        </div>
-
-        <div style={{ position: "relative", width: 150, height: 150, display: "flex", alignItems: "center", justifyContent: "center", marginTop: 6 }}>
-          {scanning && (
-            <span style={{ position: "absolute", inset: 0, borderRadius: "50%", border: "2px solid var(--scan)", animation: "pulseRing 1.1s ease-out infinite" }} />
-          )}
-          <button
-            className="scan-btn"
-            onClick={handleScan}
-            disabled={scanning || employees.length === 0}
-            aria-label="Barmaq izini oxu"
-            style={{
-              position: "relative",
-              width: 120,
-              height: 120,
-              borderRadius: "50%",
-              background: "var(--panel-2)",
-              border: `2px solid ${scanning ? "var(--scan)" : "var(--line)"}`,
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
-              cursor: scanning ? "default" : "pointer",
-              overflow: "hidden",
-              transition: "border-color 0.2s ease",
-            }}
-          >
-            <Fingerprint size={56} color={scanning ? "var(--scan)" : "var(--muted)"} strokeWidth={1.4} />
-            {scanning && (
-              <span
-                style={{
-                  position: "absolute",
-                  left: 0,
-                  right: 0,
-                  height: 3,
-                  background: "linear-gradient(90deg, transparent, var(--scan), transparent)",
-                  animation: "sweep 1.1s ease-in-out infinite",
-                }}
-              />
-            )}
-          </button>
-        </div>
-
-        <div style={{ textAlign: "center", minHeight: 20 }}>
-          <span className="mono" style={{ fontSize: 12, color: "var(--muted)" }}>
-            {employees.length === 0 ? "ƏVVƏLCƏ ADMİN PANELDƏN İŞÇİ ƏLAVƏ ET" : scanning ? "OXUNUR..." : "OXUTMAQ ÜÇÜN TOXUNUN"}
-          </span>
-        </div>
-
-        <div style={{ width: "100%", borderTop: "1px solid var(--line)", paddingTop: 14, marginTop: 4 }}>
-          <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13, color: "var(--muted)", cursor: "pointer" }}>
-            <input type="checkbox" checked={useCustomTime} onChange={(e) => setUseCustomTime(e.target.checked)} />
-            <Settings2 size={14} />
-            Test üçün skan vaxtını dəyiş
-          </label>
-          {useCustomTime && (
-            <input
-              type="time"
-              value={customTime}
-              onChange={(e) => setCustomTime(e.target.value)}
-              className="mono"
-              style={{ marginTop: 8, width: "100%", background: "var(--panel-2)", border: "1px solid var(--line)", color: "var(--text)", borderRadius: 8, padding: "8px 10px", fontSize: 14 }}
-            />
-          )}
-        </div>
-
-        {flash && (
-          <div
-            className="log-enter"
-            style={{
-              width: "100%",
-              display: "flex",
-              alignItems: "center",
-              gap: 8,
-              padding: "10px 12px",
-              borderRadius: 10,
-              fontSize: 13,
-              background: flashBg(flash.variant),
-              border: `1px solid ${flashColor(flash.variant)}`,
-              color: flashColor(flash.variant),
-            }}
-          >
-            {flash.variant === "danger" || flash.variant === "late" ? (
-              <AlertTriangle size={16} />
-            ) : flash.variant === "info" ? (
-              <Coffee size={16} />
-            ) : (
-              <CheckCircle2 size={16} />
-            )}
-            {flash.msg}
+        )}
+        {cam.state === "idle" && (
+          <div className="ck-overlay">
+            <CameraOff size={30} />
+            <strong>Kamera bağlıdır</strong>
+          </div>
+        )}
+        {cam.state === "error" && (
+          <div className="ck-overlay">
+            <AlertTriangle size={30} color="var(--bad)" />
+            <strong>Kamera açılmadı</strong>
+            <span>{cam.error}</span>
           </div>
         )}
       </div>
 
-      {/* Sağ tərəf: statistika + jurnal */}
-      <div style={{ display: "flex", flexDirection: "column", gap: 16, minWidth: 0 }}>
-        <div className="stat-grid">
-          <StatCard label="Bugünkü giriş" value={todayIn} icon={<LogIn size={16} />} />
-          <StatCard label="Gecikən" value={todayLate} icon={<AlertTriangle size={16} />} warn={todayLate > 0} />
-          <StatCard label="Cəmi qeyd" value={logs.length} icon={<Clock size={16} />} />
-        </div>
+      <button
+        className="ck-btn ck-btn-primary ck-btn-big"
+        onClick={handleScan}
+        disabled={!!busy || models !== "ready" || !ready}
+      >
+        <ScanFace size={19} />
+        {btnText}
+      </button>
 
-        <div style={{ background: "var(--panel)", border: "1px solid var(--line)", borderRadius: 16, overflow: "hidden" }}>
-          <div style={{ padding: "14px 18px", borderBottom: "1px solid var(--line)", fontSize: 13, color: "var(--muted)", letterSpacing: 0.5 }}>
-            GİRİŞ-ÇIXIŞ JURNALI
-          </div>
-          <div style={{ maxHeight: 460, overflowY: "auto" }}>
-            {logs.length === 0 ? (
-              <div style={{ padding: "40px 18px", textAlign: "center", color: "var(--muted)", fontSize: 14 }}>
-                Hələ heç bir skan edilməyib. Solda "Oxutmaq üçün toxunun" düyməsini sınayın.
-              </div>
-            ) : (
-              logs.map((l) => <LogRow key={l.id} log={l} />)
-            )}
-          </div>
+      {models === "error" && (
+        <div className="ck-flash danger">
+          <AlertTriangle size={16} style={{ flexShrink: 0, marginTop: 1 }} />
+          Üz tanıma modeli yüklənmədi. İnternet bağlantısını yoxla və səhifəni
+          yenilə.
         </div>
+      )}
+
+      {result && (
+        <ResultCard result={result} onReason={onReason} onSkip={onSkip} />
+      )}
+    </div>
+  );
+}
+
+function ResultCard({ result, onReason, onSkip }) {
+  const { kind, title, name, dept, msg, warn, time, photo, askReason, logId } =
+    result;
+  const variant =
+    kind === "in" || kind === "out"
+      ? warn
+        ? "late"
+        : "ontime"
+      : kind === "info"
+        ? "info"
+        : "danger";
+  const Icon =
+    kind === "in"
+      ? LogIn
+      : kind === "out"
+        ? LogOut
+        : kind === "denied"
+          ? XCircle
+          : kind === "info"
+            ? CheckCircle2
+            : AlertTriangle;
+
+  return (
+    <>
+      <div
+        className={`ck-flash ${variant}`}
+        role="status"
+        style={{ alignItems: "center", gap: 14, padding: 16 }}
+      >
+        {photo ? (
+          <img
+            src={photo}
+            alt=""
+            style={{
+              width: 72,
+              height: 54,
+              objectFit: "cover",
+              borderRadius: 8,
+              flexShrink: 0,
+            }}
+          />
+        ) : (
+          <Icon size={28} style={{ flexShrink: 0 }} />
+        )}
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div
+            style={{
+              fontSize: 20,
+              fontWeight: 700,
+              display: "flex",
+              alignItems: "center",
+              gap: 8,
+            }}
+          >
+            {photo && <Icon size={20} />}
+            {title}
+          </div>
+          {name && (
+            <div style={{ fontWeight: 600 }}>
+              {name}
+              {dept ? ` · ${dept}` : ""}
+            </div>
+          )}
+          {msg && <div style={{ fontSize: 13, opacity: 0.9 }}>{msg}</div>}
+          {time && (
+            <div style={{ fontSize: 12, opacity: 0.75 }}>{fmtTime(time)}</div>
+          )}
+        </div>
+      </div>
+      {askReason && (
+        <ReasonBox logId={logId} onReason={onReason} onSkip={onSkip} />
+      )}
+    </>
+  );
+}
+
+function ReasonBox({ logId, onReason, onSkip }) {
+  const [sel, setSel] = useState("");
+  const [text, setText] = useState("");
+  const value = sel === "Digər" ? text.trim() : sel;
+  return (
+    <div className="ck-card ck-pad" style={{ display: "grid", gap: 8 }}>
+      <div className="ck-sect" style={{ marginBottom: 0 }}>
+        <Clock size={16} />
+        Çıxış səbəbi
+      </div>
+      {REASONS.map((r) => (
+        <label key={r} className="ck-toggle">
+          <input
+            type="radio"
+            name="reason"
+            checked={sel === r}
+            onChange={() => setSel(r)}
+          />
+          {r}
+        </label>
+      ))}
+      {sel === "Digər" && (
+        <input
+          className="ck-field"
+          maxLength={200}
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          placeholder="Mesajını yaz"
+          aria-label="Mesaj"
+        />
+      )}
+      <div className="ck-row">
+        <button className="ck-btn" style={{ flex: 1 }} onClick={onSkip}>
+          Keç
+        </button>
+        <button
+          className="ck-btn ck-btn-primary"
+          style={{ flex: 1 }}
+          onClick={() => onReason(logId, value)}
+          disabled={!value}
+        >
+          Göndər
+        </button>
       </div>
     </div>
   );
 }
 
-function flashBg(variant) {
-  if (variant === "danger") return "rgba(232,97,61,0.14)";
-  if (variant === "late") return "rgba(232,163,61,0.12)";
-  if (variant === "info") return "rgba(77,173,232,0.12)";
-  return "rgba(95,191,125,0.12)";
-}
-function flashColor(variant) {
-  if (variant === "danger") return "var(--danger)";
-  if (variant === "late") return "var(--late)";
-  if (variant === "info") return "var(--info)";
-  return "var(--ontime)";
+/* ================= Admin görünüşü ================= */
+
+function AdminView(props) {
+  const [tab, setTab] = useState("employees");
+  const pending = props.logs.filter(
+    (l) => l.midDay && l.approval === "pending",
+  ).length;
+  const tabs = [
+    ["employees", "İşçilər", Users],
+    ["pay", "Maaş və cərimə", Wallet],
+    ["leaves", `İcazələr${pending ? ` (${pending})` : ""}`, Clock],
+    ["logs", "Jurnal", ClipboardList],
+    ["settings", "Ayarlar", SlidersHorizontal],
+  ];
+  return (
+    <div className="ck-col">
+      <div
+        className="ck-tabs"
+        role="tablist"
+        style={{ alignSelf: "flex-start" }}
+      >
+        {tabs.map(([k, label, Icon]) => (
+          <button
+            key={k}
+            role="tab"
+            aria-selected={tab === k}
+            className={`ck-tab ${tab === k ? "on" : ""}`}
+            onClick={() => setTab(k)}
+          >
+            <Icon size={14} style={{ marginRight: 6, verticalAlign: -2 }} />
+            {label}
+          </button>
+        ))}
+      </div>
+      {tab === "employees" && <EmployeesPanel {...props} />}
+      {tab === "logs" && <LogsPanel {...props} />}
+      {tab === "settings" && <SettingsPanel {...props} />}
+      {tab === "pay" && <PayPanel {...props} />}
+      {tab === "leaves" && <LeavesPanel {...props} />}
+    </div>
+  );
 }
 
-function StatCard({ label, value, icon, warn }) {
+function PayPanel({ employees, logs, settings, setSettings, updateEmployee }) {
+  const [month, setMonth] = useState(dateKey(new Date()).slice(0, 7));
+  const groups = useMemo(() => groupLogs(logs), [logs]);
+  const upd = (k, v) => setSettings((p) => ({ ...p, [k]: v }));
+  const rows = employees.map((e) => ({
+    e,
+    st: monthStats(e, groups, month, settings),
+  }));
+  const total = rows.reduce((a, r) => a + r.st.penalty, 0);
+
   return (
-    <div style={{ background: "var(--panel)", border: "1px solid var(--line)", borderRadius: 14, padding: "14px 16px", minWidth: 0 }}>
-      <div style={{ display: "flex", alignItems: "center", gap: 6, color: "var(--muted)", fontSize: 12, marginBottom: 8 }}>
+    <>
+      <div className="ck-card ck-pad">
+        <div className="ck-sect">
+          <Wallet size={16} />
+          Cərimə qaydası
+        </div>
+        <div className="ck-admin-grid">
+          <LabeledInput
+            label="Gecikmə bloku (dəqiqə)"
+            type="number"
+            min="1"
+            value={settings.penaltyBlock ?? 30}
+            onChange={(v) => upd("penaltyBlock", v)}
+          />
+          <LabeledInput
+            label="Hər blok üçün cərimə (₼)"
+            type="number"
+            step="0.01"
+            min="0"
+            value={settings.penaltyRate ?? 0.1}
+            onChange={(v) => upd("penaltyRate", v)}
+            hint="0.10 ₼ = 10 qəpik"
+          />
+          <div>
+            <label className="ck-label">Ay</label>
+            <input
+              className="ck-field"
+              type="month"
+              value={month}
+              onChange={(e) => setMonth(e.target.value)}
+            />
+          </div>
+        </div>
+        <p className="ck-hint">
+          Gecikmə hər günün ilk girişinə görə hesablanır. Hər başlanmış blok
+          cərimələnir (məs. 32 dəq = 2 blok = 0.20 ₼). Bu ay cəmi cərimə:{" "}
+          <b>{money(total)}</b>
+        </p>
+      </div>
+
+      {rows.length === 0 && (
+        <div className="ck-card ck-empty">Hələ işçi yoxdur.</div>
+      )}
+
+      {rows.map(({ e, st }) => {
+        const salary = Number(e.salary) || 0;
+        const net = Math.max(0, salary - st.penalty);
+        const custom = e.shift && Object.keys(e.shift).length > 0;
+        return (
+          <div key={e.id} className="ck-card ck-pad">
+            <div className="ck-sect">
+              <Users size={16} />
+              {e.name} <small style={{ color: "var(--muted)" }}>{e.dept}</small>
+            </div>
+            <div className="ck-admin-grid">
+              <LabeledInput
+                label="Aylıq maaş (₼)"
+                type="number"
+                min="0"
+                step="0.01"
+                value={e.salary ?? ""}
+                onChange={(v) => updateEmployee(e.id, { salary: v })}
+              />
+              {[
+                ["workStart", "İş başlanğıcı"],
+                ["workEnd", "İş bitişi"],
+                ["lunchStart", "Nahar başlanğıcı"],
+                ["lunchEnd", "Nahar bitişi"],
+              ].map(([k, l]) => (
+                <LabeledInput
+                  key={k}
+                  label={l}
+                  type="time"
+                  value={e.shift?.[k] ?? settings[k]}
+                  onChange={(v) =>
+                    v &&
+                    updateEmployee(e.id, {
+                      shift: { ...(e.shift || {}), [k]: v },
+                    })
+                  }
+                />
+              ))}
+            </div>
+            {custom && (
+              <button
+                className="ck-btn ck-btn-sm"
+                style={{ marginTop: 8 }}
+                onClick={() => updateEmployee(e.id, { shift: {} })}
+              >
+                Şirkət saatlarına qaytar
+              </button>
+            )}
+            <div className="ck-stats" style={{ marginTop: 12 }}>
+              <Stat
+                label="Gəldiyi gün"
+                value={st.present}
+                icon={<LogIn size={15} />}
+              />
+              <Stat
+                label="Gecikmə günü"
+                value={st.lateDays}
+                icon={<AlertTriangle size={15} />}
+                warn={st.lateDays > 0}
+              />
+              <Stat
+                label="Cərimə"
+                value={money(st.penalty)}
+                icon={<Wallet size={15} />}
+                warn={st.penalty > 0}
+              />
+              <Stat
+                label="Xalis maaş"
+                value={money(net)}
+                icon={<Wallet size={15} />}
+              />
+            </div>
+            {st.rows.length > 0 && (
+              <details style={{ marginTop: 10 }}>
+                <summary style={{ cursor: "pointer", fontSize: 13 }}>
+                  Gecikmə günləri ({st.rows.length})
+                </summary>
+                {st.rows.map((r) => (
+                  <div key={r.day} className="ck-hint">
+                    {r.day.split("-").reverse().join(".")}: {r.min} dəq gecikmə,
+                    cərimə {money(r.p)}
+                  </div>
+                ))}
+              </details>
+            )}
+          </div>
+        );
+      })}
+    </>
+  );
+}
+
+function LeavesPanel({ logs, setApproval }) {
+  const items = logs.filter((l) => l.midDay);
+  const ask = (l, approval) => {
+    const n = window.prompt("Qeyd (istəyə bağlı)", l.adminNote || "");
+    if (n !== null) setApproval(l.id, approval, n);
+  };
+  return (
+    <div className="ck-card" style={{ overflow: "hidden" }}>
+      <div
+        className="ck-sect"
+        style={{ padding: "16px 20px 12px", marginBottom: 0 }}
+      >
+        <Clock size={16} />
+        İş vaxtı çıxışlar ({items.length})
+      </div>
+      {items.length === 0 ? (
+        <div
+          className="ck-empty"
+          style={{ borderTop: "1px solid var(--line)" }}
+        >
+          İş saatları ərzində çıxış olmayıb.
+        </div>
+      ) : (
+        items.map((l) => (
+          <div key={l.id} className="ck-emp">
+            <div className="ck-avatar">
+              {l.photo ? <img src={l.photo} alt="" /> : l.initials}
+            </div>
+            <div className="ck-log-main">
+              <div className="ck-log-name">{l.employeeName}</div>
+              <div className="ck-log-dept" style={{ display: "block" }}>
+                {new Date(l.time).toLocaleString("az-AZ")}
+              </div>
+              <div className="ck-hint" style={{ marginTop: 2 }}>
+                {l.reason || "Səbəb göstərilməyib"} ·{" "}
+                {APPROVAL_TEXT[l.approval] || ""}
+                {l.adminNote ? ` · Qeyd: ${l.adminNote}` : ""}
+              </div>
+            </div>
+            <button
+              className="ck-btn ck-btn-sm"
+              onClick={() => ask(l, "approved")}
+            >
+              Təsdiqlə
+            </button>
+            <button
+              className="ck-btn ck-btn-sm ck-btn-danger"
+              onClick={() => ask(l, "rejected")}
+            >
+              Rədd et
+            </button>
+          </div>
+        ))
+      )}
+    </div>
+  );
+}
+
+function EmployeesPanel({
+  employees,
+  addEmployee,
+  removeEmployee,
+  clearFace,
+  onEnroll,
+}) {
+  const [name, setName] = useState("");
+  const [dept, setDept] = useState("");
+  const submit = () => {
+    if (!name.trim()) return;
+    addEmployee(name.trim(), dept.trim());
+    setName("");
+    setDept("");
+  };
+  return (
+    <div className="ck-card" style={{ overflow: "hidden" }}>
+      <div
+        className="ck-sect"
+        style={{ padding: "16px 20px 12px", marginBottom: 0 }}
+      >
+        <Users size={16} />
+        İşçilər ({employees.length})
+      </div>
+      <div className="ck-pad" style={{ paddingTop: 4 }}>
+        <div className="ck-add">
+          <input
+            className="ck-field"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            placeholder="Ad Soyad"
+            aria-label="Ad Soyad"
+          />
+          <input
+            className="ck-field"
+            value={dept}
+            onChange={(e) => setDept(e.target.value)}
+            placeholder="Şöbə (məs. Anbar)"
+            aria-label="Şöbə"
+          />
+          <button
+            className="ck-btn ck-btn-primary"
+            onClick={submit}
+            disabled={!name.trim()}
+          >
+            <UserPlus size={15} />
+            Əlavə et
+          </button>
+        </div>
+        <p className="ck-hint">
+          İşçi əlavə edəndən sonra üzünü qeydiyyatdan keçirmək pəncərəsi açılır.
+        </p>
+      </div>
+      {employees.length === 0 ? (
+        <div
+          className="ck-empty"
+          style={{ borderTop: "1px solid var(--line)" }}
+        >
+          Hələ heç bir işçi əlavə edilməyib.
+        </div>
+      ) : (
+        employees.map((e) => {
+          const n = e.descriptors?.length || 0;
+          return (
+            <div key={e.id} className="ck-emp">
+              <div className="ck-avatar">
+                {e.avatar ? <img src={e.avatar} alt="" /> : e.initials}
+              </div>
+              <div className="ck-log-main">
+                <div className="ck-log-name">{e.name}</div>
+                <div className="ck-log-dept" style={{ display: "block" }}>
+                  {e.dept}
+                </div>
+                <div className={n ? "ck-face-ok" : "ck-face-none"}>
+                  {n
+                    ? `${n} üz nümunəsi qeydiyyatdadır`
+                    : "Üz qeydiyyatdan keçməyib"}
+                </div>
+              </div>
+              <button
+                className="ck-btn ck-btn-sm"
+                onClick={() => onEnroll(e.id)}
+              >
+                <ScanFace size={14} />
+                {n ? "Yenilə" : "Üz əlavə et"}
+              </button>
+              {n > 0 && (
+                <button
+                  className="ck-btn ck-btn-sm ck-btn-danger"
+                  onClick={() => clearFace(e.id)}
+                >
+                  Üzü sil
+                </button>
+              )}
+              <button
+                className="ck-btn ck-btn-sm ck-btn-danger"
+                onClick={() => removeEmployee(e.id)}
+                aria-label={`${e.name} sil`}
+              >
+                <Trash2 size={14} />
+              </button>
+            </div>
+          );
+        })
+      )}
+    </div>
+  );
+}
+
+const STATUS_BADGE = {
+  ontime: { color: "var(--ok)", bg: "rgba(98,197,138,.13)" },
+  late: { color: "var(--late)", bg: "rgba(233,176,74,.13)" },
+  halfday: { color: "var(--bad)", bg: "rgba(238,107,91,.14)" },
+  "after-hours": { color: "var(--bad)", bg: "rgba(238,107,91,.14)" },
+  "lunch-return": { color: "var(--info)", bg: "rgba(108,196,232,.13)" },
+  "lunch-break": { color: "var(--info)", bg: "rgba(108,196,232,.13)" },
+  dayoff: { color: "var(--late)", bg: "rgba(233,176,74,.13)" },
+  "normal-out": { color: "var(--muted)", bg: "transparent" },
+  back: { color: "var(--info)", bg: "rgba(108,196,232,.13)" },
+  unknown: { color: "var(--bad)", bg: "rgba(238,107,91,.14)" },
+};
+
+function LogsPanel({ logs, deleteLog, clearLogs, exportCsv }) {
+  const [filter, setFilter] = useState("all");
+  const [photo, setPhoto] = useState(null);
+
+  const todayIn = logs.filter((l) => l.type === "in").length;
+  const late = logs.filter(
+    (l) => l.type === "in" && (l.status === "late" || l.status === "halfday"),
+  ).length;
+  const denied = logs.filter((l) => l.type === "denied").length;
+
+  const visible = logs.filter((l) => {
+    if (filter === "in") return l.type === "in";
+    if (filter === "out") return l.type === "out";
+    if (filter === "late") return l.status === "late" || l.status === "halfday";
+    if (filter === "denied") return l.type === "denied";
+    return true;
+  });
+
+  return (
+    <>
+      <div className="ck-stats">
+        <Stat label="Giriş" value={todayIn} icon={<LogIn size={15} />} />
+        <Stat
+          label="Gecikən"
+          value={late}
+          icon={<AlertTriangle size={15} />}
+          warn={late > 0}
+        />
+        <Stat
+          label="Rədd edilən"
+          value={denied}
+          icon={<XCircle size={15} />}
+          warn={denied > 0}
+        />
+      </div>
+      <div className="ck-card" style={{ overflow: "hidden" }}>
+        <div className="ck-loghead">
+          <div className="ck-tabs" role="tablist">
+            {[
+              ["all", "Hamısı"],
+              ["in", "Giriş"],
+              ["out", "Çıxış"],
+              ["late", "Gecikmə"],
+              ["denied", "Rədd edilən"],
+            ].map(([k, label]) => (
+              <button
+                key={k}
+                role="tab"
+                aria-selected={filter === k}
+                className={`ck-tab ${filter === k ? "on" : ""}`}
+                onClick={() => setFilter(k)}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+          <div className="ck-row">
+            <button
+              className="ck-btn"
+              onClick={exportCsv}
+              disabled={!logs.length}
+            >
+              <Download size={14} />
+              CSV
+            </button>
+            <button
+              className="ck-btn ck-btn-danger"
+              onClick={clearLogs}
+              disabled={!logs.length}
+            >
+              <Trash2 size={14} />
+              Hamısını sil
+            </button>
+          </div>
+        </div>
+        <div className="ck-logbody">
+          {logs.length === 0 ? (
+            <div className="ck-empty">Hələ heç bir skan edilməyib.</div>
+          ) : visible.length === 0 ? (
+            <div className="ck-empty">Bu filtrə uyğun qeyd yoxdur.</div>
+          ) : (
+            visible.map((l) => (
+              <LogRow
+                key={l.id}
+                log={l}
+                onPhoto={setPhoto}
+                onDelete={deleteLog}
+              />
+            ))
+          )}
+        </div>
+      </div>
+      {photo && (
+        <div className="ck-modal" onClick={() => setPhoto(null)}>
+          <div
+            className="ck-card ck-modal-photo"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <img src={photo} alt="Skan zamanı çəkilən şəkil" />
+            <button
+              className="ck-btn"
+              onClick={() => setPhoto(null)}
+              aria-label="Bağla"
+            >
+              <X size={16} />
+            </button>
+          </div>
+        </div>
+      )}
+    </>
+  );
+}
+
+function Stat({ label, value, icon, warn }) {
+  return (
+    <div className="ck-card ck-stat">
+      <div className="ck-stat-l">
         {icon}
         {label}
       </div>
-      <div className="mono" style={{ fontSize: 24, fontWeight: 700, color: warn ? "var(--late)" : "var(--text)" }}>
+      <div
+        className="ck-stat-v"
+        style={{ color: warn ? "var(--late)" : "var(--text)" }}
+      >
         {value}
       </div>
     </div>
   );
 }
 
-const STATUS_BADGE = {
-  ontime: { label: "vaxtında", color: "var(--ontime)", bg: "rgba(95,191,125,0.12)" },
-  late: { label: null, color: "var(--late)", bg: "rgba(232,163,61,0.12)" }, // label dinamik (dəq)
-  halfday: { label: null, color: "var(--danger)", bg: "rgba(232,97,61,0.14)" }, // label dinamik
-  "after-hours": { label: "iş saatından kənar", color: "var(--danger)", bg: "rgba(232,97,61,0.14)" },
-  "lunch-return": { label: "nahardan qayıtdı", color: "var(--info)", bg: "rgba(77,173,232,0.12)" },
-  "lunch-break": { label: "nahar fasiləsi", color: "var(--info)", bg: "rgba(77,173,232,0.12)" },
-  "normal-out": { label: "çıxış", color: "var(--muted)", bg: "transparent" },
-};
-
-function LogRow({ log }) {
+function LogRow({ log, onPhoto, onDelete }) {
   const isIn = log.type === "in";
+  const isDenied = log.type === "denied";
   const cfg = STATUS_BADGE[log.status] || STATUS_BADGE["normal-out"];
-  let label = cfg.label;
+  let label = STATUS_TEXT[log.status] || EXTRA_STATUS[log.status] || log.status;
   if (log.status === "late") label = `${log.lateMinutes} dəq gecikmə`;
   if (log.status === "halfday") label = `Yarım gün (${log.lateMinutes} dəq)`;
 
   return (
-    <div className="log-enter log-row">
+    <div className="ck-log">
+      {log.photo ? (
+        <button
+          className="ck-avatar"
+          onClick={() => onPhoto(log.photo)}
+          aria-label={`${log.employeeName} şəklini böyüt`}
+        >
+          <img src={log.photo} alt="" />
+        </button>
+      ) : (
+        <div className="ck-avatar">{log.initials}</div>
+      )}
+      <div className="ck-log-main">
+        <div className="ck-log-name">{log.employeeName}</div>
+        <div className="ck-log-dept">
+          {log.dept}
+          {log.midDay
+            ? ` · ${log.reason || "Səbəb göstərilməyib"} (${APPROVAL_TEXT[log.approval] || ""})`
+            : ""}
+        </div>
+      </div>
       <div
+        className="ck-dir"
         style={{
-          width: 34,
-          height: 34,
-          borderRadius: "50%",
-          background: "var(--panel-2)",
-          border: "1px solid var(--line)",
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "center",
-          fontSize: 12,
-          flexShrink: 0,
+          color: isDenied ? "var(--bad)" : isIn ? "var(--ok)" : "var(--muted)",
         }}
       >
-        {log.initials}
+        {isDenied ? (
+          <X size={14} />
+        ) : isIn ? (
+          <LogIn size={14} />
+        ) : (
+          <LogOut size={14} />
+        )}
+        {isDenied ? "Rədd" : isIn ? "Giriş" : "Çıxış"}
       </div>
-      <div style={{ flex: 1, minWidth: 90 }}>
-        <div style={{ fontSize: 14 }}>{log.employeeName}</div>
-        <div className="log-dept" style={{ fontSize: 12, color: "var(--muted)" }}>{log.dept}</div>
-      </div>
-      <div style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 12, color: isIn ? "var(--ontime)" : "var(--muted)" }}>
-        {isIn ? <LogIn size={14} /> : <LogOut size={14} />}
-        {isIn ? "Giriş" : "Çıxış"}
-      </div>
-      <div className="mono" style={{ fontSize: 13, textAlign: "right", minWidth: 70 }}>
-        {fmtTime(log.time)}
-      </div>
-      <div style={{ minWidth: 150, textAlign: "right" }}>
+      <div className="ck-time">{fmtTime(log.time)}</div>
+      <div style={{ minWidth: 130, textAlign: "right" }}>
         <span
-          className="mono"
+          className="ck-badge"
           style={{
-            fontSize: 11,
             color: cfg.color,
             background: cfg.bg,
-            padding: cfg.bg === "transparent" ? 0 : "3px 8px",
-            borderRadius: 999,
+            padding: cfg.bg === "transparent" ? 0 : undefined,
           }}
         >
           {label}
         </span>
       </div>
+      <button
+        className="ck-btn ck-btn-danger ck-btn-sm"
+        onClick={() => onDelete(log.id)}
+        aria-label="Qeydi sil"
+      >
+        <Trash2 size={13} />
+      </button>
     </div>
   );
 }
 
-/* ---------------- ADMIN VIEW ---------------- */
-
-function AdminView({ employees, newName, setNewName, newDept, setNewDept, addEmployee, removeEmployee, settings, setSettings }) {
-  function updateSetting(key, value) {
+function SettingsPanel({
+  settings,
+  setSettings,
+  useCustomTime,
+  setUseCustomTime,
+  customTime,
+  setCustomTime,
+}) {
+  const update = (key, value) =>
     setSettings((prev) => ({ ...prev, [key]: value }));
-  }
-
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
-      {/* Şirkət iş qaydaları */}
-      <div style={{ background: "var(--panel)", border: "1px solid var(--line)", borderRadius: 16, padding: 20 }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 14, fontSize: 13, color: "var(--muted)" }}>
-          <SlidersHorizontal size={15} />
-          ŞİRKƏT İŞ QAYDALARI
+    <>
+      <div className="ck-card ck-pad">
+        <div className="ck-sect">
+          <ScanFace size={16} />
+          Üz yoxlaması
         </div>
+        <div className="ck-admin-grid">
+          <LabeledInput
+            label="Uyğunluq həddi (0.3–0.7)"
+            type="number"
+            step="0.05"
+            min="0.3"
+            max="0.7"
+            value={settings.matchThreshold}
+            onChange={(v) => update("matchThreshold", v)}
+            hint="Kiçik rəqəm daha sərt yoxlayır. Tövsiyə: 0.5"
+          />
+          <LabeledInput
+            label="Təkrar skan fasiləsi (saniyə)"
+            type="number"
+            min="0"
+            value={settings.cooldownSec}
+            onChange={(v) => update("cooldownSec", v)}
+            hint="Eyni işçi təsadüfən iki dəfə qeyd olunmasın"
+          />
+          <LabeledInput
+            label="Geri sayım (0–5 saniyə)"
+            type="number"
+            min="0"
+            max="5"
+            value={settings.countdown}
+            onChange={(v) => update("countdown", v)}
+          />
+          <div>
+            <label className="ck-label">Canlılıq yoxlaması</label>
+            <div className="ck-select-wrap">
+              <select
+                className="ck-field"
+                value={settings.liveness}
+                onChange={(e) => update("liveness", e.target.value)}
+              >
+                <option value="off">Söndürülüb</option>
+                <option value="blink">Göz qırpma</option>
+                <option value="turn">Baş çevirmə</option>
+                <option value="random">Təsadüfi</option>
+              </select>
+              <ChevronDown size={16} />
+            </div>
+            <div className="ck-hint">Foto ilə aldatmanın qarşısını alır</div>
+          </div>
+        </div>
+        <label className="ck-toggle">
+          <input
+            type="checkbox"
+            checked={settings.saveSnapshots}
+            onChange={(e) => update("saveSnapshots", e.target.checked)}
+          />
+          <span>
+            Skan şəklini jurnalda saxla{" "}
+            <small>(tanınmayan şəxslərin şəkli də daxil)</small>
+          </span>
+        </label>
+        <div
+          style={{
+            borderTop: "1px solid var(--line)",
+            paddingTop: 12,
+            marginTop: 8,
+          }}
+        >
+          <label
+            className="ck-toggle"
+            style={{ color: "var(--muted)", padding: 0 }}
+          >
+            <input
+              type="checkbox"
+              checked={useCustomTime}
+              onChange={(e) => setUseCustomTime(e.target.checked)}
+            />
+            <Settings2 size={14} />
+            Test üçün skan vaxtını dəyiş
+          </label>
+          {useCustomTime && (
+            <input
+              type="time"
+              className="ck-field"
+              style={{ marginTop: 8 }}
+              value={customTime}
+              onChange={(e) => setCustomTime(e.target.value)}
+            />
+          )}
+        </div>
+      </div>
 
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 10 }}>
-          <LabeledInput label="İş başlanğıcı" type="time" value={settings.workStart} onChange={(v) => updateSetting("workStart", v)} />
-          <LabeledInput label="İş bitişi" type="time" value={settings.workEnd} onChange={(v) => updateSetting("workEnd", v)} />
-          <LabeledInput label="Nahar başlanğıcı" type="time" value={settings.lunchStart} onChange={(v) => updateSetting("lunchStart", v)} />
-          <LabeledInput label="Nahar bitişi" type="time" value={settings.lunchEnd} onChange={(v) => updateSetting("lunchEnd", v)} />
+      <div className="ck-card ck-pad">
+        <div className="ck-sect">
+          <SlidersHorizontal size={16} />
+          Şirkət iş qaydaları
+        </div>
+        <div className="ck-admin-grid">
+          <LabeledInput
+            label="İş başlanğıcı"
+            type="time"
+            value={settings.workStart}
+            onChange={(v) => update("workStart", v)}
+          />
+          <LabeledInput
+            label="İş bitişi"
+            type="time"
+            value={settings.workEnd}
+            onChange={(v) => update("workEnd", v)}
+          />
+          <LabeledInput
+            label="Nahar başlanğıcı"
+            type="time"
+            value={settings.lunchStart}
+            onChange={(v) => update("lunchStart", v)}
+          />
+          <LabeledInput
+            label="Nahar bitişi"
+            type="time"
+            value={settings.lunchEnd}
+            onChange={(v) => update("lunchEnd", v)}
+          />
           <LabeledInput
             label="Gecikmə limiti (dəqiqə)"
             type="number"
             value={settings.graceMinutes}
-            onChange={(v) => updateSetting("graceMinutes", v)}
+            onChange={(v) => update("graceMinutes", v)}
           />
           <LabeledInput
             label="Yarım gün limiti (dəqiqə)"
             type="number"
             value={settings.absentMinutes}
-            onChange={(v) => updateSetting("absentMinutes", v)}
+            onChange={(v) => update("absentMinutes", v)}
           />
         </div>
-
-        <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13, color: "var(--muted)", cursor: "pointer" }}>
-          <input type="checkbox" checked={settings.nightShift} onChange={(e) => updateSetting("nightShift", e.target.checked)} />
-          <Moon size={14} />
+        <label className="ck-toggle">
+          <input
+            type="checkbox"
+            checked={settings.nightShift}
+            onChange={(e) => update("nightShift", e.target.checked)}
+          />
+          <Moon size={14} style={{ marginTop: 2 }} />
           Gecə növbəsi rejimi
         </label>
       </div>
 
-      {/* Yeni işçi */}
-      <div style={{ background: "var(--panel)", border: "1px solid var(--line)", borderRadius: 16, padding: 20 }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 14, fontSize: 13, color: "var(--muted)" }}>
-          <UserPlus size={15} />
-          YENİ İŞÇİ ƏLAVƏ ET
-        </div>
-        <div className="admin-form">
-          <input value={newName} onChange={(e) => setNewName(e.target.value)} placeholder="Ad Soyad" style={inputStyle()} />
-          <input value={newDept} onChange={(e) => setNewDept(e.target.value)} placeholder="Şöbə (məs. Anbar)" style={inputStyle()} />
-          <button
-            onClick={addEmployee}
-            disabled={!newName.trim()}
-            style={{
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
-              gap: 6,
-              background: newName.trim() ? "var(--scan)" : "var(--panel-2)",
-              color: newName.trim() ? "#0d1a17" : "var(--muted)",
-              border: "1px solid var(--line)",
-              borderRadius: 10,
-              padding: "10px 16px",
-              fontSize: 13,
-              fontWeight: 600,
-              cursor: newName.trim() ? "pointer" : "not-allowed",
-              whiteSpace: "nowrap",
-            }}
-          >
-            <UserPlus size={15} />
-            Əlavə et
-          </button>
-        </div>
-      </div>
+      <PasswordCard />
+    </>
+  );
+}
 
-      {/* İşçi siyahısı */}
-      <div style={{ background: "var(--panel)", border: "1px solid var(--line)", borderRadius: 16, overflow: "hidden" }}>
-        <div style={{ padding: "14px 18px", borderBottom: "1px solid var(--line)", fontSize: 13, color: "var(--muted)", display: "flex", alignItems: "center", gap: 8 }}>
-          <Users size={15} />
-          İŞÇİ SİYAHISI ({employees.length})
-        </div>
-        {employees.length === 0 ? (
-          <div style={{ padding: "40px 18px", textAlign: "center", color: "var(--muted)", fontSize: 14 }}>
-            Hələ heç bir işçi əlavə edilməyib.
-          </div>
-        ) : (
-          employees.map((e) => (
-            <div key={e.id} className="admin-table-row">
-              <div
-                style={{
-                  width: 34,
-                  height: 34,
-                  borderRadius: "50%",
-                  background: "var(--panel-2)",
-                  border: "1px solid var(--line)",
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "center",
-                  fontSize: 12,
-                  flexShrink: 0,
-                }}
-              >
-                {e.initials}
-              </div>
-              <div style={{ flex: 1, minWidth: 0 }}>
-                <div style={{ fontSize: 14 }}>{e.name}</div>
-                <div style={{ fontSize: 12, color: "var(--muted)" }}>{e.dept}</div>
-              </div>
-              <button
-                onClick={() => removeEmployee(e.id)}
-                aria-label="Sil"
-                style={{
-                  background: "transparent",
-                  border: "1px solid var(--line)",
-                  color: "var(--danger)",
-                  borderRadius: 8,
-                  padding: "7px 9px",
-                  cursor: "pointer",
-                  display: "flex",
-                  alignItems: "center",
-                }}
-              >
-                <Trash2 size={14} />
-              </button>
-            </div>
-          ))
-        )}
+function PasswordCard() {
+  const [isDefault, setIsDefault] = useState(false);
+  const [pw, setPw] = useState("");
+  const [msg, setMsg] = useState("");
+  useEffect(() => {
+    isDefaultPassword().then(setIsDefault);
+  }, []);
+
+  async function save() {
+    if (pw.length < 6) return setMsg("Parol ən azı 6 simvol olmalıdır.");
+    try {
+      await changePassword(pw);
+      setPw("");
+      setIsDefault(false);
+      setMsg("Parol dəyişdirildi.");
+    } catch {
+      setMsg("Parol saxlanmadı.");
+    }
+  }
+
+  return (
+    <div className="ck-card ck-pad">
+      <div className="ck-sect">
+        <KeyRound size={16} />
+        Admin parolu
       </div>
+      {isDefault && (
+        <div className="ck-warn" style={{ marginBottom: 10 }}>
+          Standart parol istifadə olunur ({DEFAULT_PASSWORD}). Dəyişdirmək
+          tövsiyə olunur.
+        </div>
+      )}
+      <div className="ck-add">
+        <input
+          className="ck-field"
+          type="password"
+          value={pw}
+          onChange={(e) => setPw(e.target.value)}
+          placeholder="Yeni parol"
+          aria-label="Yeni parol"
+        />
+        <button className="ck-btn ck-btn-primary" onClick={save} disabled={!pw}>
+          Dəyiş
+        </button>
+      </div>
+      {msg && <p className="ck-hint">{msg}</p>}
     </div>
   );
 }
 
-function LabeledInput({ label, type, value, onChange }) {
+function LabeledInput({ label, hint, onChange, ...rest }) {
   return (
     <div>
-      <label className="mono" style={{ fontSize: 10, color: "var(--muted)", letterSpacing: 0.5, display: "block", marginBottom: 4 }}>
-        {label.toUpperCase()}
-      </label>
-      <input type={type} value={value} onChange={(e) => onChange(e.target.value)} style={inputStyle()} />
+      <label className="ck-label">{label}</label>
+      <input
+        className="ck-field"
+        onChange={(e) => onChange(e.target.value)}
+        {...rest}
+      />
+      {hint && <div className="ck-hint">{hint}</div>}
     </div>
   );
 }
 
-function inputStyle() {
-  return {
-    background: "var(--panel-2)",
-    border: "1px solid var(--line)",
-    color: "var(--text)",
-    borderRadius: 10,
-    padding: "10px 12px",
-    fontSize: 14,
-    width: "100%",
-  };
-}
+/* ================= Üzü qeydiyyatdan keçirmə ================= */
 
-/* ---------------- PASSWORD GATE ---------------- */
+function EnrollModal({ emp, models, onSave, onClose }) {
+  const cam = useCamera();
+  const [samples, setSamples] = useState([]);
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState("");
 
-function PasswordGate({ pwInput, setPwInput, pwError, onSubmit, onClose }) {
+  useEffect(() => {
+    cam.start();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  async function capture() {
+    if (busy || samples.length >= MAX_SAMPLES) return;
+    const video = cam.videoRef.current;
+    if (!video || video.readyState < 2) return setMsg("Kamera hazır deyil.");
+    setBusy(true);
+    setMsg("");
+    try {
+      const found = await detectWithDescriptors(video);
+      if (found.length === 0)
+        setMsg("Üz tapılmadı. Kameraya düz bax, işıqlı yerdə ol.");
+      else if (found.length > 1) setMsg("Kadrda yalnız bir nəfər olmalıdır.");
+      else
+        setSamples((prev) => [
+          ...prev,
+          {
+            descriptor: Array.from(found[0].descriptor),
+            photo: takeSnapshot(video),
+          },
+        ]);
+    } catch {
+      setMsg("Üz oxuna bilmədi. Yenidən cəhd et.");
+    }
+    setBusy(false);
+  }
+
+  const ready = cam.state === "ready";
+
   return (
-    <div
-      style={{
-        position: "fixed",
-        inset: 0,
-        background: "rgba(8,11,14,0.72)",
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "center",
-        padding: 16,
-        zIndex: 50,
-      }}
-      onClick={onClose}
-    >
+    <div className="ck-modal" onClick={onClose}>
       <div
+        className="ck-card ck-modal-box ck-modal-wide"
         onClick={(e) => e.stopPropagation()}
-        className={pwError ? "shake" : ""}
-        style={{
-          width: "100%",
-          maxWidth: 320,
-          background: "var(--panel)",
-          border: "1px solid var(--line)",
-          borderRadius: 16,
-          padding: 22,
-        }}
       >
-        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
-          <Lock size={16} color="var(--scan)" />
-          <div style={{ fontSize: 15, fontWeight: 600 }}>Admin Panelə Giriş</div>
+        <div className="ck-sect" style={{ marginBottom: 4 }}>
+          <ScanFace size={16} color="var(--accent)" />
+          {emp.name}: üzü qeydiyyatdan keçir
         </div>
-        <p style={{ fontSize: 12, color: "var(--muted)", marginTop: 6, marginBottom: 14 }}>
-          Demo parol: <span className="mono">{"admin123"}</span>
+        <p className="ck-hint" style={{ marginBottom: 12 }}>
+          Üzünü fərqli bucaqlardan 3–5 dəfə çək: düz, bir az sağa, bir az sola.
+          Nə qədər çox nümunə olsa, tanıma bir o qədər dəqiq olar.
         </p>
-        <input
-          type="password"
-          autoFocus
-          value={pwInput}
-          onChange={(e) => setPwInput(e.target.value)}
-          onKeyDown={(e) => e.key === "Enter" && onSubmit()}
-          placeholder="Parol"
-          style={inputStyle()}
-        />
-        {pwError && (
-          <div style={{ fontSize: 12, color: "var(--danger)", marginTop: 8 }}>
-            Parol yanlışdır, yenidən cəhd et.
+
+        <div className={`ck-view ${busy ? "work" : ""}`}>
+          <video ref={cam.videoRef} className="ck-video" playsInline muted />
+          {ready && (
+            <>
+              <span className="ck-corner tl" />
+              <span className="ck-corner tr" />
+              <span className="ck-corner bl" />
+              <span className="ck-corner br" />
+              {busy && <span className="ck-scanline" />}
+            </>
+          )}
+          {!ready && (
+            <div className="ck-overlay">
+              {cam.state === "error" ? (
+                <AlertTriangle size={28} color="var(--bad)" />
+              ) : (
+                <Camera size={28} />
+              )}
+              <span>
+                {cam.state === "error" ? cam.error : "Kamera açılır..."}
+              </span>
+            </div>
+          )}
+        </div>
+
+        <div className="ck-thumbs">
+          {samples.length === 0 && (
+            <span className="ck-hint">Hələ nümunə çəkilməyib.</span>
+          )}
+          {samples.map((s, i) => (
+            <div className="ck-thumb" key={i}>
+              <img src={s.photo} alt={`Nümunə ${i + 1}`} />
+              <button
+                onClick={() =>
+                  setSamples((prev) => prev.filter((_, j) => j !== i))
+                }
+                aria-label="Nümunəni sil"
+              >
+                <X size={12} />
+              </button>
+            </div>
+          ))}
+        </div>
+
+        {msg && (
+          <div className="ck-flash danger" style={{ marginBottom: 12 }}>
+            <AlertTriangle size={16} style={{ flexShrink: 0, marginTop: 1 }} />
+            {msg}
           </div>
         )}
-        <div style={{ display: "flex", gap: 8, marginTop: 16 }}>
-          <button onClick={onClose} style={{ ...inputStyle(), cursor: "pointer", flex: 1, textAlign: "center" }}>
+        {models !== "ready" && (
+          <p className="ck-hint" style={{ marginBottom: 12 }}>
+            {models === "loading"
+              ? "Üz tanıma modeli yüklənir..."
+              : "Model yüklənmədi. İnternet bağlantısını yoxla və səhifəni yenilə."}
+          </p>
+        )}
+
+        <div className="ck-row ck-wrap-row">
+          <button
+            className="ck-btn"
+            onClick={capture}
+            disabled={
+              !ready ||
+              busy ||
+              models !== "ready" ||
+              samples.length >= MAX_SAMPLES
+            }
+          >
+            <Camera size={15} />
+            Şəkil çək ({samples.length}/{MAX_SAMPLES})
+          </button>
+          <div style={{ flex: 1 }} />
+          <button className="ck-btn" onClick={onClose}>
             İmtina
           </button>
           <button
-            onClick={onSubmit}
-            style={{
-              flex: 1,
-              background: "var(--scan)",
-              color: "#0d1a17",
-              border: "1px solid var(--line)",
-              borderRadius: 10,
-              padding: "10px 12px",
-              fontSize: 14,
-              fontWeight: 600,
-              cursor: "pointer",
-            }}
+            className="ck-btn ck-btn-primary"
+            onClick={() => onSave(emp.id, samples)}
+            disabled={samples.length === 0}
+          >
+            Yadda saxla
+          </button>
+        </div>
+        {emp.descriptors?.length > 0 && (
+          <p className="ck-hint">
+            Yadda saxlasan, bu işçinin köhnə üz məlumatı yenisi ilə əvəz
+            olunacaq.
+          </p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ================= Parol pəncərəsi ================= */
+
+function PasswordGate({ onSuccess, onClose }) {
+  const [pw, setPw] = useState("");
+  const [err, setErr] = useState(false);
+  const [checking, setChecking] = useState(false);
+
+  async function submit() {
+    if (checking) return;
+    setChecking(true);
+    const ok = await verifyPassword(pw);
+    setChecking(false);
+    if (ok) onSuccess();
+    else setErr(true);
+  }
+
+  return (
+    <div className="ck-modal" onClick={onClose}>
+      <div
+        className={`ck-card ck-modal-box ${err ? "ck-shake" : ""}`}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="ck-sect" style={{ marginBottom: 12 }}>
+          <Lock size={16} color="var(--accent)" />
+          Admin panelə giriş
+        </div>
+        <input
+          className="ck-field"
+          type="password"
+          autoFocus
+          value={pw}
+          onChange={(e) => {
+            setPw(e.target.value);
+            setErr(false);
+          }}
+          onKeyDown={(e) => e.key === "Enter" && submit()}
+          placeholder="Parol"
+          aria-label="Parol"
+        />
+        {err && (
+          <div style={{ fontSize: 12, color: "var(--bad)", marginTop: 8 }}>
+            Parol yanlışdır, yenidən cəhd et.
+          </div>
+        )}
+        <div className="ck-row" style={{ marginTop: 16 }}>
+          <button className="ck-btn" style={{ flex: 1 }} onClick={onClose}>
+            İmtina
+          </button>
+          <button
+            className="ck-btn ck-btn-primary"
+            style={{ flex: 1 }}
+            onClick={submit}
+            disabled={checking}
           >
             Daxil ol
           </button>
