@@ -9,7 +9,7 @@ function openDb() {
   });
 }
 
-export async function dbGet(key) {
+async function idbGet(key) {
   const db = await openDb();
   return new Promise((resolve, reject) => {
     const req = db.transaction("kv").objectStore("kv").get(key);
@@ -18,7 +18,7 @@ export async function dbGet(key) {
   });
 }
 
-export async function dbSet(key, value) {
+async function idbSet(key, value) {
   const db = await openDb();
   return new Promise((resolve, reject) => {
     const tx = db.transaction("kv", "readwrite");
@@ -26,6 +26,35 @@ export async function dbSet(key, value) {
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error);
   });
+}
+
+/* ---------- Server + brauzer yaddaşı ---------- */
+
+export async function dbGet(key) {
+  try {
+    const r = await fetch(`/api/kv/${key}`);
+    if (r.ok) {
+      const j = await r.json();
+      if (j.value !== null && j.value !== undefined) return j.value;
+    }
+  } catch {
+    /* server işləmir */
+  }
+  return idbGet(key); // serverdə yoxdursa, köhnə brauzer məlumatını götür
+}
+
+export async function dbSet(key, value) {
+  try {
+    await idbSet(key, value);
+  } catch {
+    /* ehtiyat nüsxə alınmadı */
+  }
+  const r = await fetch(`/api/kv/${key}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ value }),
+  });
+  if (!r.ok) throw new Error("server");
 }
 
 /* ---------- Admin parolu (hash ilə saxlanılır) ---------- */
@@ -38,7 +67,6 @@ async function sha256(text) {
     const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
     return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
   }
-  // HTTPS olmayan mühitdə ehtiyat variant (daha zəif)
   let h = 5381;
   for (let i = 0; i < text.length; i++) h = ((h << 5) + h + text.charCodeAt(i)) | 0;
   return "x" + h;
