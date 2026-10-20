@@ -31,16 +31,18 @@ async function idbSet(key, value) {
 /* ---------- Server + brauzer yaddaşı ---------- */
 
 export async function dbGet(key) {
+  let r = null;
   try {
-    const r = await fetch(`/api/kv/${key}`);
-    if (r.ok) {
-      const j = await r.json();
-      if (j.value !== null && j.value !== undefined) return j.value;
-    }
+    r = await fetch(`/api/kv/${key}`, { cache: "no-store" });
   } catch {
-    /* server işləmir */
+    r = null;
   }
-  return idbGet(key); // serverdə yoxdursa, köhnə brauzer məlumatını götür
+  if (r && r.ok) {
+    const j = await r.json();
+    if (j.value !== null && j.value !== undefined) return j.value;
+    return idbGet(key); // serverdə hələ yoxdur: köhnə brauzer məlumatı
+  }
+  throw new Error("server oxunmadı");
 }
 
 export async function dbSet(key, value) {
